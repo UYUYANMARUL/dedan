@@ -9,6 +9,7 @@ import {IRegistry} from "@ensdomains/contracts-v2/registry/interfaces/IRegistry.
 import {ILabelStore} from "@ensdomains/contracts-v2/utils/interfaces/ILabelStore.sol";
 import {LibLabel} from "@ensdomains/contracts-v2/utils/LibLabel.sol";
 import {NameCoder} from "@ens/contracts/utils/NameCoder.sol";
+import {DedanCells} from "./DedanCells.sol";
 import {DedanResolver} from "./DedanResolver.sol";
 import {DedanRoles} from "./DedanRoles.sol";
 import {IWorldIDVerifier} from "./IWorldIDVerifier.sol";
@@ -52,6 +53,8 @@ contract DedanRegistry is PermissionedRegistry {
     DedanResolver public dedanResolver;
     /// @notice The cells contract: registers cell names here and resolves them.
     address public cells;
+    /// @notice Devnet switch: nodes may reveal an hour's key before the hour ends.
+    bool public earlyReveal;
 
     mapping(uint256 action => mapping(uint256 nullifier => bool used)) public nullifierUsed;
     mapping(StakeKind kind => uint256 amount) public minStake;
@@ -61,6 +64,9 @@ contract DedanRegistry is PermissionedRegistry {
     mapping(address account => uint256 amount) public accountStake;
     mapping(address account => uint64 at) public accountUnbondAt;
     mapping(address account => bool suspended) public accountSuspended;
+    mapping(uint256 labelId => mapping(uint64 hour => bool)) public revealed;
+    /// @notice When a withdrawn label may be registered again: its votes have left the two-day median window.
+    mapping(uint256 labelId => uint64 at) public reusableAt;
 
     event HumanVerified(address indexed account, uint256 indexed action, uint256 nullifier);
     event NodeRegistered(bytes32 indexed labelHash, string label, address indexed owner, uint256 stake);
@@ -78,6 +84,7 @@ contract DedanRegistry is PermissionedRegistry {
     event WorldIdSet(address verifier, uint64 rpId);
     event ResolverSet(address resolver);
     event CellsSet(address cells);
+    event EarlyRevealSet(bool on);
 
     error UseRegisterNode();
     error NotNodeOwner();
@@ -89,6 +96,10 @@ contract DedanRegistry is PermissionedRegistry {
     error ZeroAddress();
     error NotCells();
     error CellLabel();
+    error NodeIsSuspended();
+    error AlreadyRevealed();
+    error RevealTooEarly();
+    error LabelCooling();
 
     constructor(
         ILabelStore labelStore,
@@ -123,6 +134,11 @@ contract DedanRegistry is PermissionedRegistry {
     function setMinStake(StakeKind kind, uint256 amount) external onlyRootRoles(DedanRoles.ROLE_CONFIGURE) {
         minStake[kind] = amount;
         emit MinStakeSet(kind, amount);
+    }
+
+    function setEarlyReveal(bool on) external onlyRootRoles(DedanRoles.ROLE_CONFIGURE) {
+        earlyReveal = on;
+        emit EarlyRevealSet(on);
     }
 
     function setWorldId(IWorldIDVerifier verifier, uint64 rpId) external onlyRootRoles(DedanRoles.ROLE_CONFIGURE) {
@@ -188,6 +204,7 @@ contract DedanRegistry is PermissionedRegistry {
     }
 
     function requestUnbondAccount() external {
+        if (accountSuspended[msg.sender]) revert AccountIsSuspended();
         if (accountUnbondAt[msg.sender] != 0) revert WrongStatus();
         uint64 at = uint64(block.timestamp) + UNBONDING_PERIOD;
         accountUnbondAt[msg.sender] = at;
@@ -195,6 +212,7 @@ contract DedanRegistry is PermissionedRegistry {
     }
 
     function withdrawAccount() external {
+        if (accountSuspended[msg.sender]) revert AccountIsSuspended();
         uint64 at = accountUnbondAt[msg.sender];
         if (at == 0) revert WrongStatus();
         if (block.timestamp < at) revert StillUnbonding();
@@ -219,6 +237,7 @@ contract DedanRegistry is PermissionedRegistry {
         if (address(dedanResolver) == address(0)) revert ZeroAddress();
         if (LibCell.isCellLabel(label)) revert CellLabel();
         uint256 labelId = LibLabel.id(label);
+        if (block.timestamp < reusableAt[labelId]) revert LabelCooling();
         tokenId = _register(
             label,
             msg.sender,
@@ -238,8 +257,8 @@ contract DedanRegistry is PermissionedRegistry {
         emit NodeRegistered(bytes32(labelId), label, msg.sender, stake);
     }
 
-    function requestUnbond(string calldata label) external onlyNodeOwner(label) {
-        uint256 labelId = LibLabel.id(label);
+    function requestUnbond(string calldata label) external {
+        uint256 labelId = _ownNode(label);
         if (nodeUnbondAt[labelId] != 0) revert WrongStatus();
         uint64 at = uint64(block.timestamp) + UNBONDING_PERIOD;
         nodeUnbondAt[labelId] = at;
@@ -247,25 +266,32 @@ contract DedanRegistry is PermissionedRegistry {
     }
 
     /// @notice After unbonding: the stake comes back to the current owner and the name is removed, which
-    ///         bumps its EAC version so no old role survives a later re-registration.
-    function withdraw(string calldata label) external onlyNodeOwner(label) {
-        uint256 labelId = LibLabel.id(label);
+    ///         bumps its EAC version so no old role survives a later re-registration. The node leaves its cells,
+    ///         its records are cleared, and the label rests until its votes have aged out.
+    function withdraw(string calldata label) external {
+        uint256 labelId = _ownNode(label);
         uint64 at = nodeUnbondAt[labelId];
         if (at == 0) revert WrongStatus();
         if (block.timestamp < at) revert StillUnbonding();
         uint256 amount = nodeStake[labelId];
         nodeStake[labelId] = 0;
         nodeUnbondAt[labelId] = 0;
-        nodeSuspended[labelId] = false;
+        reusableAt[labelId] = uint64((block.timestamp / 1 days + 2) * 1 days);
         _removeNode(labelId);
+        if (cells != address(0)) DedanCells(cells).removeNode(labelId);
+        dedanResolver.clearRecords(nodeOf(label));
         USDC.safeTransfer(msg.sender, amount);
         emit NodeWithdrawn(bytes32(labelId), msg.sender, amount);
     }
 
-    /// @notice A node's hot key reveals the key that minted the hour's fetch tokens (ARCHITECTURE.md §7).
+    /// @notice A node's hot key reveals the key that minted the hour's fetch tokens (ARCHITECTURE.md §7), once,
+    ///         after the hour ended (unless `earlyReveal`). `hour` is `unix time / 3600`.
     function revealKey(string calldata label, uint64 hour, bytes32 kHour) external {
         uint256 labelId = LibLabel.id(label);
         _checkRoles(labelId, DedanRoles.ROLE_NODE_SIGNER, msg.sender);
+        if (!earlyReveal && (uint256(hour) + 1) * 3600 > block.timestamp) revert RevealTooEarly();
+        if (revealed[labelId][hour]) revert AlreadyRevealed();
+        revealed[labelId][hour] = true;
         emit KeyRevealed(bytes32(labelId), hour, kHour);
     }
 
@@ -296,9 +322,11 @@ contract DedanRegistry is PermissionedRegistry {
         return getOwner(LibLabel.id(label));
     }
 
+    /// @notice Owned, not suspended, not unbonding, and holding the minimum node stake.
     function isNodeActive(string calldata label) external view returns (bool) {
         uint256 labelId = LibLabel.id(label);
-        return getOwner(labelId) != address(0) && !nodeSuspended[labelId] && nodeUnbondAt[labelId] == 0;
+        return getOwner(labelId) != address(0) && !nodeSuspended[labelId] && nodeUnbondAt[labelId] == 0
+            && nodeStake[labelId] >= minStake[StakeKind.Node];
     }
 
     function isNodeSigner(string calldata label, address key) external view returns (bool) {
@@ -313,14 +341,16 @@ contract DedanRegistry is PermissionedRegistry {
         return _hasHumanRole(account, DedanRoles.ROLE_ATTESTER) && !accountSuspended[account];
     }
 
-    /// @notice An auditor may run assigned probes while it holds the governance minimum stake.
+    /// @notice An auditor may run assigned probes while it holds the governance minimum stake and is not unbonding.
     function isAuditor(address account) public view returns (bool) {
         return _hasHumanRole(account, DedanRoles.ROLE_AUDITOR) && !accountSuspended[account]
-            && accountStake[account] >= minStake[StakeKind.Auditor];
+            && accountUnbondAt[account] == 0 && accountStake[account] >= minStake[StakeKind.Auditor];
     }
 
+    /// @notice A resolver operator serves while it holds the governance minimum resolver bond.
     function isResolverOperator(address account) external view returns (bool) {
-        return hasRootRoles(DedanRoles.ROLE_RESOLVER_OPERATOR, account) && !accountSuspended[account];
+        return hasRootRoles(DedanRoles.ROLE_RESOLVER_OPERATOR, account) && !accountSuspended[account]
+            && accountStake[account] >= minStake[StakeKind.Resolver];
     }
 
     /// @notice World ID signal: the account, hashed to the field as IDKit does.
@@ -340,9 +370,11 @@ contract DedanRegistry is PermissionedRegistry {
 
     // ---- internals ----------------------------------------------------------------------------
 
-    modifier onlyNodeOwner(string calldata label) {
-        if (getOwner(LibLabel.id(label)) != msg.sender) revert NotNodeOwner();
-        _;
+    /// @dev The label id of a node the caller owns; a suspended node's stake stays put.
+    function _ownNode(string calldata label) internal view returns (uint256 labelId) {
+        labelId = LibLabel.id(label);
+        if (getOwner(labelId) != msg.sender) revert NotNodeOwner();
+        if (nodeSuspended[labelId]) revert NodeIsSuspended();
     }
 
     /// @dev The registry's role checks translate any id through `getResource`; a human's resource never has a

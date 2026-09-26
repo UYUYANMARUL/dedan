@@ -3,21 +3,22 @@
 //! The aggregator, the countersigner and `recompute` run exactly this; anything not in `inputs/` cannot
 //! reach money.
 
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::fs;
 use std::path::{Path, PathBuf};
 
 use alloy::primitives::{keccak256, Address, B256, U256};
 use alloy::sol_types::SolValue;
 use dedan_core::assign::{assign, AccountInfo, AssignParams, Assignment, Yesterday};
-use dedan_core::config::{self, AccountCfg, Geo};
+use dedan_core::config::{self, Geo};
 use dedan_core::ens::NodeRecord;
-use dedan_core::envelope::{Envelope, KeyLookup};
+use dedan_core::envelope::{Envelope, KeyLookup, MAX_SKEW_S};
 use dedan_core::identity::{Identity, RegistryEvent};
-use dedan_core::map::{self, Map, MapParams, TokenCheck, Validator};
+use dedan_core::map::{self, Map, MapParams, Rejection, TokenCheck, TokenStatus, Validator};
 use dedan_core::merkle;
 use dedan_core::schedule;
 use dedan_core::score::{self, Cumulative, Payees, ScoreInput, ScoreOutput, ScoreParams, ValidProbe};
+use dedan_core::settlement::{self, AccountState};
 use dedan_core::token::Token;
 use dedan_core::types::*;
 use serde::{de::DeserializeOwned, Deserialize, Serialize};
@@ -50,8 +51,22 @@ pub struct Manifest {
     pub period_secs: u64,
     pub sample_n: usize,
     pub map_k: usize,
+    /// Auditors the schedule assigns per account; results from the others are not scored.
+    #[serde(default = "default_auditors_per_account")]
+    pub auditors_per_account: usize,
     pub prev_outputs_hash: String,
     pub files: BTreeMap<String, String>,
+}
+
+fn default_auditors_per_account() -> usize {
+    5
+}
+
+/// A tier's daily list price in the on-chain table at `registry_block`, micro-USDC.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TierPrice {
+    pub tier: Tier,
+    pub per_day: u128,
 }
 
 /// What carries over from the previous period's outputs: cumulative leaves, the sets (for stickiness) and
@@ -70,7 +85,12 @@ pub struct Inputs {
     pub events: Vec<RegistryEvent>,
     pub probes: Vec<Envelope<ProbeBatch>>,
     pub samples: Vec<AssetSample>,
-    pub configs: Vec<AccountCfg>,
+    /// Account configs as the control plane relays them, signed by the account keys (verified in `compute`).
+    pub configs: Vec<Envelope<AccountConfig>>,
+    /// Every account created on the Settlement contract, as it stood at `registry_block`.
+    pub accounts: Vec<AccountState>,
+    /// The daily price of every tier the configs use, from the on-chain table at `registry_block`.
+    pub prices: Vec<TierPrice>,
     pub nodes: BTreeMap<NodeId, NodeRecord>,
     pub geo: Geo,
     pub prev: Prev,
@@ -192,6 +212,8 @@ impl Inputs {
         write_jsonl(&d.join("probe-results.jsonl"), &self.probes)?;
         write_jsonl(&d.join("asset-samples.jsonl"), &self.samples)?;
         write_jsonl(&d.join("configs.jsonl"), &self.configs)?;
+        write_json(&d.join("accounts.json"), &self.accounts)?;
+        write_json(&d.join("prices.json"), &self.prices)?;
         write_json(&d.join("nodes.json"), &self.nodes)?;
         write_json(&d.join("geo.json"), &self.geo)?;
         write_json(&d.join("prev.json"), &self.prev)?;
@@ -201,6 +223,8 @@ impl Inputs {
             "probe-results.jsonl",
             "asset-samples.jsonl",
             "configs.jsonl",
+            "accounts.json",
+            "prices.json",
             "nodes.json",
             "geo.json",
             "prev.json",
@@ -226,6 +250,8 @@ impl Inputs {
             probes: read_jsonl(&d.join("probe-results.jsonl"))?,
             samples: read_jsonl(&d.join("asset-samples.jsonl"))?,
             configs: read_jsonl(&d.join("configs.jsonl"))?,
+            accounts: read_json(&d.join("accounts.json"))?,
+            prices: read_json(&d.join("prices.json"))?,
             nodes: read_json(&d.join("nodes.json"))?,
             geo: read_json(&d.join("geo.json"))?,
             prev: read_json(&d.join("prev.json"))?,
@@ -272,9 +298,40 @@ pub fn compute(inp: &Inputs, inputs_hash: B256) -> Result<Outputs, Error> {
     let labels = identity.labels_by_hash();
     let reveals = identity.reveals();
 
-    // 1. probe batches: a registered auditor's signature over exactly this content, then the token check
+    // 0. the accounts: a config counts only with the signature of the account key on chain (§9), the newest
+    //    version per account; the price is the tier's in the on-chain table
+    let chain_accounts: BTreeMap<AccountId, &AccountState> =
+        inp.accounts.iter().map(|a| (a.id.clone(), a)).collect();
+    let mut configs: BTreeMap<AccountId, AccountConfig> = BTreeMap::new();
+    let mut by_version: Vec<&Envelope<AccountConfig>> = inp.configs.iter().collect();
+    by_version.sort_by_key(|e| e.payload.version);
+    for env in by_version {
+        let id = &env.payload.account_id;
+        let key = chain_accounts.get(id).map(|a| a.key).unwrap_or(Address::ZERO);
+        if settlement::verify_config(env, key).is_ok()
+            && settlement::newer(configs.get(id).map(|c| c.version), env.payload.version)
+        {
+            configs.insert(id.clone(), env.payload.clone());
+        }
+    }
+    let seed = schedule::seed_of(m.start);
+
+    // the auditors the schedule assigned to each account (§7); results from anyone else are not scored
+    let candidates = identity.auditors();
+    let assigned: BTreeMap<AccountId, BTreeSet<Address>> = configs
+        .keys()
+        .map(|id| {
+            let set = schedule::auditors_for(seed, id, &candidates, m.auditors_per_account);
+            (id.clone(), set.into_iter().collect())
+        })
+        .collect();
+
+    // 1. probe batches: a registered auditor's signature over exactly this content, signed inside this period
+    //    and filed once, then the token check at the result's time
     let mut probes: Vec<ValidProbe> = Vec::new();
     let mut rejected_batches = Vec::new();
+    let mut batches_seen: HashSet<(String, u64)> = HashSet::new();
+    let mut tokens_seen: HashSet<(AuditorId, String)> = HashSet::new();
     for env in &inp.probes {
         let reason = match env.recover() {
             Err(e) => Some(e.to_string()),
@@ -282,22 +339,47 @@ pub fn compute(inp: &Inputs, inputs_hash: B256) -> Result<Outputs, Error> {
                 Some(format!("{} holds no auditor role with stake", env.signer))
             }
             Ok(addr) if env.payload.auditor_id.0 != addr => Some("auditor id differs from the signer".into()),
+            // a batch from another period cannot be slipped into this one's inputs
+            Ok(_) if env.ts + MAX_SKEW_S < m.start || env.ts > m.end + MAX_SKEW_S => {
+                Some(format!("signed at {}, outside the period {}..{}", env.ts, m.start, m.end))
+            }
+            Ok(_) if !batches_seen.insert((env.signer.clone(), env.nonce)) => {
+                Some(format!("nonce {} filed twice", env.nonce))
+            }
             Ok(_) => None,
         };
         if let Some(r) = reason {
             rejected_batches.push((env.signer.clone(), r));
             continue;
         }
+        let auditor = env.payload.auditor_id;
         for r in &env.payload.results {
             let served_by = r
                 .token
                 .as_deref()
                 .and_then(|t| t.parse::<Token>().ok())
                 .map(|t| t.node_id);
-            let token_ok = match (&served_by, &r.token) {
-                (Some(node), Some(t)) => reveals.check(t, node, &r.prefix),
-                _ => false,
+            let status = match (&served_by, &r.token) {
+                (Some(node), Some(t)) => reveals.check(t, node, r.ts),
+                _ => TokenStatus::Invalid,
             };
+            // the node never revealed that hour's key: the result proves nothing either way, and it is the
+            // node's loss, not evidence against the auditor
+            if r.ok && status == TokenStatus::NoKey {
+                continue;
+            }
+            let token_ok = status == TokenStatus::Valid;
+            // one real fetch backs one result: a token repeated by the same auditor counts once
+            if let (true, Some(t)) = (token_ok, &r.token) {
+                if !tokens_seen.insert((auditor, t.clone())) {
+                    continue;
+                }
+            }
+            let on_schedule = assigned.get(&r.account).is_some_and(|a| a.contains(&auditor.0));
+            // off-schedule results are not scored; a forged "up" is still evidence
+            if !on_schedule && !(r.ok && !token_ok) {
+                continue;
+            }
             probes.push(ValidProbe {
                 auditor: env.payload.auditor_id,
                 probe: r.probe,
@@ -330,16 +412,32 @@ pub fn compute(inp: &Inputs, inputs_hash: B256) -> Result<Outputs, Error> {
     let mut v = Validator::new(params.clone(), reveals, &inp.geo);
     let (rows, rejected) = v.validate_events(&identity.attested, &labels);
     let in_period = |ts: u64| ts >= m.start && ts < m.end;
+    // pay: at most `attestation_pay_cap` valid attestations per human per epoch (the day), counted in chain
+    // order across every period of the epoch; a token repeated by the same human counts once
+    let cap = ScoreParams::default().attestation_pay_cap;
+    let mut per_epoch: HashMap<(AuditorId, u64), usize> = HashMap::new();
     let mut attestations_per_auditor: BTreeMap<AuditorId, usize> = BTreeMap::new();
-    for r in rows.iter().filter(|r| in_period(r.ts)) {
-        *attestations_per_auditor.entry(r.auditor).or_default() += 1;
+    let mut attested_tokens: HashSet<(AuditorId, String)> = HashSet::new();
+    for r in &rows {
+        if !attested_tokens.insert((r.auditor, r.token.clone())) {
+            continue;
+        }
+        let n = per_epoch.entry((r.auditor, params.epoch_of(r.ts))).or_default();
+        if *n < cap && in_period(r.ts) {
+            *attestations_per_auditor.entry(r.auditor).or_default() += 1;
+        }
+        *n += 1;
     }
-    let map_evidence: Vec<map::Evidence> =
-        rejected.iter().filter(|e| in_period(e.ts)).cloned().collect();
+    // a key the node never revealed is nobody's evidence
+    let map_evidence: Vec<map::Evidence> = rejected
+        .iter()
+        .filter(|e| in_period(e.ts) && e.reason != Rejection::Unverifiable)
+        .cloned()
+        .collect();
 
     // 3. the slot sets, sticky on the previous period's
     let nodes = config::node_infos(&identity, &inp.nodes);
-    let accounts: Vec<AccountInfo> = inp.configs.iter().map(AccountCfg::info).collect();
+    let accounts: Vec<AccountInfo> = configs.values().map(AccountInfo::from_config).collect();
     let quality: HashMap<(AccountId, NodeId), f64> = inp
         .prev
         .quality
@@ -351,7 +449,7 @@ pub fn compute(inp: &Inputs, inputs_hash: B256) -> Result<Outputs, Error> {
         quality: &quality,
     };
     let assignment = assign(
-        schedule::seed_of(m.start),
+        seed,
         &nodes,
         &accounts,
         &map,
@@ -360,10 +458,27 @@ pub fn compute(inp: &Inputs, inputs_hash: B256) -> Result<Outputs, Error> {
     );
 
     // 4. scoring
-    let list_price: BTreeMap<AccountId, u128> = inp
-        .configs
+    let list_price: BTreeMap<AccountId, u128> = configs
+        .values()
+        .map(|c| {
+            let per_day = inp
+                .prices
+                .iter()
+                .find(|p| p.tier == c.tier)
+                .map(|p| p.per_day)
+                .unwrap_or(0);
+            (c.account_id.clone(), settlement::list_price(per_day, m.period_secs))
+        })
+        .collect();
+    // what each account on chain can still be billed: its balance, minus the bills published before this
+    // period and not yet applied, minus a withdrawal on its way out
+    let balances: BTreeMap<AccountId, u128> = inp
+        .accounts
         .iter()
-        .map(|a| (a.id(), a.list_price(m.period_secs)))
+        .map(|a| {
+            let billed = inp.prev.cumulative.bill.get(&a.id).copied().unwrap_or(0);
+            (a.id.clone(), a.effective_balance(billed))
+        })
         .collect();
     let digests: BTreeMap<(AccountId, String), AssetDigest> = inp
         .samples
@@ -398,6 +513,7 @@ pub fn compute(inp: &Inputs, inputs_hash: B256) -> Result<Outputs, Error> {
             conforming_resolvers: &[],
             payees: &payees,
             prev: &inp.prev.cumulative,
+            balances: &balances,
         },
         &ScoreParams::default(),
     );
@@ -596,6 +712,94 @@ mod tests {
             .abi_encode();
         assert_eq!(enc.len(), 320);
         assert_eq!(digest(31337, Address::from([9u8; 20]), &r), keccak256(enc));
+    }
+
+    /// The period's inputs are checked, not trusted: a batch signed in another period or filed twice counts for
+    /// nothing, and a config counts only with the account key's signature.
+    #[test]
+    fn compute_checks_batches_and_configs() {
+        use alloy::signers::local::PrivateKeySigner;
+        use dedan_core::identity::{human_resource, roles, STAKE_AUDITOR};
+        let auditor = PrivateKeySigner::from_slice(&[3u8; 32]).unwrap();
+        let customer = PrivateKeySigner::from_slice(&[4u8; 32]).unwrap();
+        let a = auditor.address();
+        let acme = AccountId::new("acme");
+        let file = |nodes: u8| -> dedan_core::config::AccountCfg {
+            serde_json::from_str(&format!(
+                r#"{{"label":"acme","hostnames":["www.images.com"],"nodes":{nodes},"class":"100M","availability":"99.9"}}"#
+            ))
+            .unwrap()
+        };
+        let good = Envelope::sign(file(6).to_config(1), acme.signer(), 10_000, 1, &customer).unwrap();
+        // newer, but signed by someone else: if it counted, its tier (3 nodes) has no price and the list would be 0
+        let forged = Envelope::sign(file(3).to_config(2), acme.signer(), 10_000, 2, &auditor).unwrap();
+        let batch = |ts: u64, nonce: u64| {
+            let b = ProbeBatch {
+                auditor_id: AuditorId(a),
+                period: 0,
+                results: vec![],
+            };
+            Envelope::sign(b, AuditorId(a).signer(), ts, nonce, &auditor).unwrap()
+        };
+        let inputs = Inputs {
+            manifest: Manifest {
+                period: 1,
+                wall_index: 0,
+                start: 10_000,
+                end: 10_120,
+                registry_block: 1,
+                chain_time: 10_100,
+                chain_id: 31337,
+                settlement: Address::ZERO,
+                governance: Address::ZERO,
+                price_table_version: 1,
+                score_version: SCORE_VERSION,
+                period_secs: 120,
+                sample_n: 4,
+                map_k: 1,
+                auditors_per_account: 5,
+                prev_outputs_hash: String::new(),
+                files: BTreeMap::new(),
+            },
+            events: vec![
+                RegistryEvent::MinStakeSet {
+                    kind: STAKE_AUDITOR,
+                    amount: 100,
+                },
+                RegistryEvent::RolesChanged {
+                    resource: human_resource(a),
+                    account: a,
+                    new: roles::auditor(),
+                },
+                RegistryEvent::AccountStaked {
+                    account: a,
+                    amount: 100,
+                },
+            ],
+            probes: vec![batch(10_010, 1), batch(10_020, 1), batch(5_000, 2)],
+            samples: vec![],
+            configs: vec![good, forged],
+            accounts: vec![AccountState {
+                id: acme.clone(),
+                key: customer.address(),
+                balance: 1_000_000_000,
+                ..Default::default()
+            }],
+            prices: vec![TierPrice {
+                tier: file(6).to_config(1).tier,
+                per_day: 7_200_000_000,
+            }],
+            nodes: BTreeMap::new(),
+            geo: Geo::default(),
+            prev: Prev::default(),
+        };
+        let out = compute(&inputs, B256::ZERO).unwrap();
+        let reasons: Vec<&str> = out.rejected_batches.iter().map(|(_, r)| r.as_str()).collect();
+        assert_eq!(reasons.len(), 2, "{reasons:?}");
+        assert!(reasons.iter().any(|r| r.contains("filed twice")));
+        assert!(reasons.iter().any(|r| r.contains("outside the period")));
+        assert_eq!(out.score.multipliers[&acme].list, 10_000_000, "the account's own config, priced on chain");
+        assert!(out.bill_leaves.iter().any(|l| l.who == acme));
     }
 
     #[test]

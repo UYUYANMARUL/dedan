@@ -1,7 +1,3 @@
 [
-  {
-    "label": "acme", "hostnames": ["www.images.com"], "nodes": 6, "class": "100M", "availability": "99.9",
-    "origin": "http://origin", "asset_list": "/assets/manifest.txt",
-    "price_usdc_per_day": 7200
-  }
+  {"label": "acme", "hostnames": ["www.images.com"], "nodes": 6, "class": "100M", "availability": "99.9", "origin": "http://origin", "asset_list": "/assets/manifest.txt", "cache_rules": {"default_ttl_s": 60, "keep_query_string": true, "max_object_bytes": 52428800}}
 ]

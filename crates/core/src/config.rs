@@ -1,6 +1,7 @@
-//! What every service starts from: the deployment's contract addresses, the account configs (published by
-//! the control plane from M3 on; `deploy/devnet/accounts.json` until then), the client locator (GeoIP in
-//! production, the devnet's host tables) and the node table the assignment reads.
+//! What every service starts from: the deployment's contract addresses, the customer's account file (what
+//! the customer's CLI turns into a config signed by its account key; services read the signed configs the
+//! control plane relays, see [`crate::settlement`]), the client locator (GeoIP in production, the devnet's
+//! host tables) and the node table the assignment reads.
 
 use crate::assign::{AccountInfo, NodeInfo};
 use crate::ens::NodeRecord;
@@ -30,7 +31,7 @@ pub struct Deployment {
     pub governance: Address,
     pub aggregator: Address,
     pub countersigner: Address,
-    /// The control plane's signing key: configs, purges it relays and TXT records carry its signature.
+    /// The control plane's key: the registrar that signs account registrations, and the ACME side.
     #[serde(default)]
     pub control_plane: Address,
 }
@@ -41,7 +42,8 @@ impl Deployment {
     }
 }
 
-/// One customer account as the control plane publishes it (§9): tier, hostnames, origin, asset list, price.
+/// One customer account as the customer describes it (§9): tier, hostnames, origin, asset list, cache rules,
+/// node policy. The price is not here: the tier's price comes from the on-chain price table.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct AccountCfg {
     pub label: String,
@@ -56,9 +58,10 @@ pub struct AccountCfg {
     /// Path of the customer's asset manifest on the origin: one asset path per line.
     #[serde(default)]
     pub asset_list: String,
-    /// List price per day in USDC, from the price table; a settlement period bills its share of it.
     #[serde(default)]
-    pub price_usdc_per_day: f64,
+    pub cache_rules: Option<CacheRules>,
+    #[serde(default)]
+    pub node_policy: NodePolicy,
 }
 
 impl AccountCfg {
@@ -70,21 +73,41 @@ impl AccountCfg {
         AccountId::new(&self.label)
     }
 
-    pub fn info(&self) -> AccountInfo {
-        AccountInfo {
-            id: self.id(),
-            nodes: self.nodes,
-            class: self.class,
-            availability: self.availability,
-            min_node_stake: 0,
-            operator_allowlist: vec![],
-            operator_denylist: vec![],
+    /// The config the customer signs with its account key (`dedan-cp config`), as version `version`.
+    pub fn to_config(&self, version: u64) -> AccountConfig {
+        let origin = self.origin.trim_end_matches('/');
+        AccountConfig {
+            account_id: self.id(),
+            account_key: Address::ZERO,
+            domains: self.hostnames.clone(),
+            origins: vec![Origin {
+                url: self.origin.clone(),
+                host_header: None,
+                weight: 1,
+            }],
+            tier: Tier {
+                nodes: self.nodes,
+                class: self.class,
+                availability: self.availability,
+            },
+            cache_rules: self.cache_rules.clone().unwrap_or(CacheRules {
+                default_ttl_s: 600,
+                keep_query_string: true,
+                max_object_bytes: 50 << 20,
+            }),
+            asset_list: if self.asset_list.is_empty() {
+                String::new()
+            } else {
+                format!("{origin}{}", self.asset_list)
+            },
+            node_policy: self.node_policy.clone(),
+            version,
+            seq: 0,
         }
     }
 
-    /// The list price of one period of `period_secs`, micro-USDC.
-    pub fn list_price(&self, period_secs: u64) -> u128 {
-        (self.price_usdc_per_day * 1e6 * period_secs as f64 / 86_400.0).round() as u128
+    pub fn info(&self) -> AccountInfo {
+        AccountInfo::from_config(&self.to_config(0))
     }
 }
 
@@ -173,7 +196,9 @@ pub fn node_infos(identity: &Identity, records: &BTreeMap<NodeId, NodeRecord>) -
                 id: n.label.clone(),
                 active: identity.node_active(&n.label),
                 entry_passed: true,
-                class: r.class.unwrap_or(Class::M100),
+                // ponytail: the declared `dedan.class` record would let an operator claim 1G and take ten times
+                // the slots; everyone is 100M until class probes measure it (score's `class_qualified`)
+                class: Class::M100,
                 stake: n.stake,
                 ip: IpAddr::V4(r.ipv4?),
                 asn: None,
@@ -201,13 +226,15 @@ mod tests {
     }
 
     #[test]
-    fn account_config_prices_a_period() {
+    fn account_file_becomes_a_config() {
         let a: AccountCfg = serde_json::from_str(
-            r#"{"label":"acme","hostnames":["www.images.com"],"nodes":6,"class":"100M","availability":"99.9","price_usdc_per_day":2880}"#,
+            r#"{"label":"acme","hostnames":["www.images.com"],"nodes":6,"class":"100M","availability":"99.9","origin":"http://origin/","asset_list":"/assets/manifest.txt","cache_rules":{"default_ttl_s":60,"keep_query_string":true,"max_object_bytes":1048576},"price_usdc_per_day":7200}"#,
         )
         .unwrap();
-        assert_eq!(a.list_price(300), 10_000_000);
+        let c = a.to_config(7);
+        assert_eq!(c.version, 7);
+        assert_eq!(c.asset_list, "http://origin/assets/manifest.txt");
+        assert_eq!(c.cache_rules.default_ttl_s, 60);
         assert_eq!(a.info().nodes, 6);
-        assert_eq!(a.origin, "");
     }
 }

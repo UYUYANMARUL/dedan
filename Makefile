@@ -31,11 +31,14 @@ workspace-test: ## every crate's unit tests
 images: ## build the services image (nameserver, auditor, aggregator; cargo-chef caches the dependency build)
 	$(COMPOSE) build resolver
 
-devnet: ## start anvil, deploy the contracts, register the city nodes on ENS, then the nameserver, Pebble, the origin, five city nodes and five users on the simulated WAN
+devnet: ## start anvil, deploy the contracts, register the city nodes on ENS, then the nameserver, Pebble, the origin, the control plane with acme's config signed by its account key, five city nodes and five users on the simulated WAN
 	$(COMPOSE) up -d --build --wait anvil pebble origin
 	$(COMPOSE) run --rm -T deployer
 	sh deploy/scripts/register-nodes.sh
-	$(COMPOSE) up -d --build --wait resolver cp $(NODES) $(USERS) dashboard dozzle
+	$(COMPOSE) up -d --build --wait resolver cp
+	@for i in 1 2 3 4 5 6 7 8 9 10; do $(COMPOSE) exec -T -e DEDAN_KEY_INDEX=1 cp dedan-cp config acme && exit 0; sleep 2; done; \
+	  echo "the control plane did not accept acme's config (is acme created on chain by the deploy script?)"; exit 1
+	$(COMPOSE) up -d --build --wait $(NODES) $(USERS) dashboard dozzle
 	@echo "dashboard: http://localhost:9090   logs and terminals: http://localhost:9999"
 
 devnet-down: ## stop everything (cities added with add-node included) and delete volumes
@@ -60,7 +63,7 @@ add-node: ## add a node at a location to the running devnet: make add-node LABEL
 add-client: ## add a client (a human's device) at a location: make add-client LABEL=berlin LAT=52.52 LON=13.405
 	sh deploy/scripts/add-client.sh $(LABEL) $(LAT) $(LON)
 
-e2e: ## the traffic path: signed configs, certificates through the control plane, HTTPS miss then hit with a token, purge, stale on origin failure, 421, a forged endpoint not served
+e2e: ## the traffic path: account-signed configs, certificates through the control plane, HTTPS miss then hit with a token, purge, stale on origin failure and while revalidating, 421, a forged endpoint not served
 	sh deploy/scripts/e2e.sh
 
 demo-settlement: ## fresh devnet: the settlement loop (city auditors, aggregator, countersigner) with a tampered node, a dead node, a spoofing attester and a lying auditor; report, recompute, void, claim

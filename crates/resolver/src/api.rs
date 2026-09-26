@@ -1,7 +1,7 @@
 //! Management API: ACME TXT records from the control plane (the pebble-challtestsrv shape, so lego's exec
 //! hook is unchanged) and read-only views of the snapshot for demos and tests.
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::sync::Arc;
 
 use axum::body::Bytes;
@@ -13,6 +13,7 @@ use serde::Deserialize;
 use serde_json::{json, Value};
 
 use crate::state::State;
+use dedan_core::types::AccountId;
 
 pub fn router(state: Arc<State>) -> Router {
     Router::new()
@@ -180,9 +181,19 @@ async fn map(AxState(s): AxState<Arc<State>>) -> Json<Value> {
 
 async fn assignment(AxState(s): AxState<Arc<State>>) -> Json<Value> {
     let snap = s.snap.read().await;
-    Json(
-        json!({ "seed": snap.assignment.seed, "sets": snap.assignment.sets, "updated_at": snap.updated_at }),
-    )
+    let previous = s.previous.read().await.as_ref().map(|p| p.period);
+    let suspended: Vec<AccountId> = s.suspended.read().expect("suspended lock").iter().cloned().collect();
+    let versions: BTreeMap<AccountId, u64> = s
+        .configs
+        .read()
+        .expect("configs lock")
+        .iter()
+        .map(|(id, c)| (id.clone(), c.version))
+        .collect();
+    Json(json!({
+        "seed": snap.assignment.seed, "sets": snap.assignment.sets, "updated_at": snap.updated_at,
+        "sticky_on_period": previous, "suspended": suspended, "config_versions": versions,
+    }))
 }
 
 async fn set_txt(

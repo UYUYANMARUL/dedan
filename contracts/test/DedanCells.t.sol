@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: MIT
 pragma solidity ^0.8.20;
 
-import {Test} from "forge-std/Test.sol";
+import {Test, Vm} from "forge-std/Test.sol";
 import {PermissionedRegistry} from "@ensdomains/contracts-v2/registry/PermissionedRegistry.sol";
 import {IPermissionedRegistry} from "@ensdomains/contracts-v2/registry/interfaces/IPermissionedRegistry.sol";
 import {IRegistry} from "@ensdomains/contracts-v2/registry/interfaces/IRegistry.sol";
@@ -130,6 +130,12 @@ contract DedanCellsTest is Test {
 
     function labelId(string memory label) internal pure returns (uint256) {
         return uint256(keccak256(bytes(label)));
+    }
+
+    function pair(uint64 a, uint64 b) internal pure returns (uint64[] memory c) {
+        c = new uint64[](2);
+        c[0] = a;
+        c[1] = b;
     }
 
     function test_join_needs_the_owner_of_an_active_node() public {
@@ -267,6 +273,192 @@ contract DedanCellsTest is Test {
         assertEq(still, "100M");
         vm.prank(human1);
         vm.expectRevert(DedanCells.NotMember.selector);
+        cells.attest(FRA_CELL, one("fra", 10));
+    }
+
+    function test_join_accepts_only_resolution_2_cell_ids() public {
+        assertTrue(LibCell.isCell(0x0821ecffffffffff)); // Istanbul
+        uint64 base121 = (FRA_CELL & ~(uint64(0x7f) << 45)) | (uint64(121) << 45);
+        assertTrue(LibCell.isCell(base121));
+        uint64[9] memory bad = [
+            FRA_CELL | uint64(1) << 60, // mode 3, same 15 low nibbles: would take FRA_CELL's name
+            FRA_CELL | uint64(1) << 63, // high bit
+            FRA_CELL | uint64(1) << 56, // reserved bits
+            (FRA_CELL & ~(uint64(0xf) << 52)) | (uint64(3) << 52), // resolution 3
+            (FRA_CELL & ~(uint64(0x7f) << 45)) | (uint64(122) << 45), // base cell 122
+            FRA_CELL | uint64(7) << 42, // digit 1 is 7
+            FRA_CELL | uint64(7) << 39, // digit 2 is 7
+            FRA_CELL & ~uint64(1), // digit 15 used
+            0
+        ];
+        for (uint256 i; i < bad.length; ++i) {
+            assertFalse(LibCell.isCell(bad[i]));
+            vm.prank(op1);
+            vm.expectRevert(abi.encodeWithSelector(DedanCells.BadCell.selector, bad[i]));
+            cells.join("fra", pair(IST_CELL, bad[i]));
+        }
+        assertFalse(cells.registered(IST_CELL), "a rejected batch registers nothing");
+
+        // the real cell keeps its name and stays joinable
+        vm.prank(op1);
+        cells.join("fra", cellsOf(FRA_CELL));
+        vm.prank(op2);
+        cells.join("ist", cellsOf(FRA_CELL));
+        assertEq(cells.membersOf(FRA_CELL).length, 2);
+    }
+
+    function test_registry_and_cells_only_call_each_other() public {
+        vm.prank(stranger);
+        vm.expectRevert(DedanRegistry.NotCells.selector);
+        dedan.registerCell(FRA_CELL);
+        vm.prank(op1);
+        cells.join("fra", cellsOf(FRA_CELL));
+        vm.prank(op1);
+        vm.expectRevert(DedanCells.NotRegistry.selector);
+        cells.removeNode(labelId("fra"));
+    }
+
+    function test_withdraw_leaves_every_cell_and_the_label_rests_until_its_votes_aged_out() public {
+        vm.prank(op1);
+        cells.join("fra", pair(FRA_CELL, IST_CELL));
+        vm.prank(op2);
+        cells.join("ist", cellsOf(FRA_CELL));
+        vm.prank(op1);
+        dedan.requestUnbond("fra");
+        vm.warp(block.timestamp + 7 days);
+        vm.prank(human1); // still a member while it unbonds
+        cells.attest(FRA_CELL, one("fra", 10));
+
+        vm.expectEmit(true, true, false, false, address(cells));
+        emit DedanCells.Left(FRA_CELL, bytes32(labelId("fra")));
+        vm.expectEmit(true, true, false, false, address(cells));
+        emit DedanCells.Left(IST_CELL, bytes32(labelId("fra")));
+        vm.prank(op1);
+        dedan.withdraw("fra");
+
+        uint256[] memory left = cells.membersOf(FRA_CELL);
+        assertEq(left.length, 1);
+        assertEq(left[0], labelId("ist"));
+        assertEq(cells.membersOf(IST_CELL).length, 0);
+        (, uint256 aliasLabel) = cells.aliasOf(cells.aliasNode(FRA_CELL, labelId("fra")));
+        assertEq(aliasLabel, 0);
+        (string memory v,) = textOf("821faffffffffff.dedan.eth", "dedan.nodes");
+        assertEq(v, "ist");
+        (v,) = textOf("821faffffffffff.dedan.eth", "dedan.votes.fra");
+        assertEq(v, "");
+
+        // the label rests until the vote cast on its last day has left the two-day window
+        uint256 reusable = (block.timestamp / 1 days + 2) * 1 days;
+        vm.warp(reusable - 1);
+        (, uint32 votes) = cells.median(FRA_CELL, labelId("fra"));
+        assertEq(votes, 1, "yesterday's vote still counts");
+        vm.startPrank(op2);
+        vm.expectRevert(DedanRegistry.LabelCooling.selector);
+        dedan.registerNode("fra", new address[](0), 1_000e6);
+        vm.warp(reusable);
+        dedan.registerNode("fra", new address[](0), 1_000e6);
+        cells.join("fra", cellsOf(FRA_CELL));
+        vm.stopPrank();
+        (, votes) = cells.median(FRA_CELL, labelId("fra"));
+        assertEq(votes, 0, "nothing inherited from the old node");
+        (v,) = textOf("fra.821faffffffffff.dedan.eth", "dedan.class");
+        assertEq(v, "", "the old node's records were cleared");
+        assertEq(resolver.addr(dedan.nodeOf("fra")), address(0));
+    }
+
+    function test_leave_then_rejoin_and_cell_records_answer_only_for_members() public {
+        vm.prank(op1);
+        cells.join("fra", pair(FRA_CELL, IST_CELL));
+        vm.prank(human1);
+        cells.attest(FRA_CELL, one("fra", 10));
+        (string memory v,) = textOf("821faffffffffff.dedan.eth", "dedan.latency.fra");
+        assertEq(v, "12");
+
+        vm.prank(op1);
+        cells.leave("fra", cellsOf(FRA_CELL));
+        (v,) = textOf("821faffffffffff.dedan.eth", "dedan.latency.fra");
+        assertEq(v, "", "not a member: no record, like snapshot");
+        (v,) = textOf("821faffffffffff.dedan.eth", "dedan.votes.fra");
+        assertEq(v, "");
+        (, uint32 votes) = cells.median(FRA_CELL, labelId("fra"));
+        assertEq(votes, 1, "the vote itself stays for its two days");
+
+        vm.prank(op1);
+        cells.join("fra", cellsOf(FRA_CELL));
+        assertEq(cells.membersOf(FRA_CELL).length, 1);
+        (v,) = textOf("fra.821faffffffffff.dedan.eth", "dedan.latency");
+        assertEq(v, "12");
+        (v,) = textOf("821faffffffffff.dedan.eth", "dedan.votes.fra");
+        assertEq(v, "1");
+
+        // the per-node cell list followed leave and join: the withdrawal leaves each cell exactly once
+        vm.prank(op1);
+        dedan.requestUnbond("fra");
+        vm.warp(block.timestamp + 7 days);
+        vm.recordLogs();
+        vm.prank(op1);
+        dedan.withdraw("fra");
+        Vm.Log[] memory logs = vm.getRecordedLogs();
+        uint256 lefts;
+        for (uint256 i; i < logs.length; ++i) {
+            if (logs[i].emitter == address(cells) && logs[i].topics[0] == DedanCells.Left.selector) ++lefts;
+        }
+        assertEq(lefts, 2);
+        assertEq(cells.membersOf(FRA_CELL).length, 0);
+        assertEq(cells.membersOf(IST_CELL).length, 0);
+    }
+
+    function test_alias_cell_keys_never_fall_back_to_the_operators_text() public {
+        bytes32 own = dedan.nodeOf("fra");
+        vm.startPrank(op1);
+        resolver.setText(own, "dedan.latency", "1");
+        resolver.setText(own, "dedan.votes", "999");
+        resolver.setText(own, "dedan.cell", "somewhere");
+        resolver.setText(own, "dedan.node", "someone");
+        cells.join("fra", cellsOf(FRA_CELL));
+        vm.stopPrank();
+        string memory a = "fra.821faffffffffff.dedan.eth";
+        (string memory v,) = textOf(a, "dedan.latency");
+        assertEq(v, "", "no votes yet, and not the operator's number");
+        (v,) = textOf(a, "dedan.votes");
+        assertEq(v, "");
+        (v,) = textOf(a, "dedan.cell");
+        assertEq(v, "821faffffffffff");
+        (v,) = textOf(a, "dedan.node");
+        assertEq(v, "fra");
+        (v,) = textOf(a, "dedan.class");
+        assertEq(v, "100M", "the node's other records come through");
+        vm.prank(human1);
+        cells.attest(FRA_CELL, one("fra", 30));
+        (v,) = textOf(a, "dedan.latency");
+        assertEq(v, "28");
+    }
+
+    function test_a_batch_naming_a_node_twice_keeps_the_last_sample() public {
+        vm.prank(op1);
+        cells.join("fra", cellsOf(FRA_CELL));
+        DedanCells.Sample[] memory b = new DedanCells.Sample[](2);
+        b[0] = sample("fra", 10);
+        b[1] = sample("fra", 90);
+        vm.prank(human1);
+        cells.attest(FRA_CELL, b);
+        (uint32 ms, uint32 votes) = cells.median(FRA_CELL, labelId("fra"));
+        assertEq(votes, 1);
+        assertEq(ms, 92);
+        uint16[32] memory h = cells.histogram(FRA_CELL, labelId("fra"), uint32(block.timestamp / 1 days));
+        assertEq(h[1], 0);
+        assertEq(h[11], 1);
+    }
+
+    function test_a_suspended_attester_cannot_attest() public {
+        vm.prank(op1);
+        cells.join("fra", cellsOf(FRA_CELL));
+        vm.prank(gov);
+        dedan.suspendAccount(human1, true);
+        vm.prank(human1);
+        vm.expectRevert(DedanCells.NotAttester.selector);
+        cells.attest(FRA_CELL, one("fra", 10));
+        vm.prank(human2);
         cells.attest(FRA_CELL, one("fra", 10));
     }
 }

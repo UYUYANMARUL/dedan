@@ -21,7 +21,7 @@ interface IDedanCellsRecords {
 ///         itself, which writes the initial records at registration. The name's namehash is bound to its
 ///         registry label at registration so owner lookups need no reverse mapping.
 ///         The alias names `<label>.<cell>.dedan.eth` (a node inside a cell it joined) resolve here too: the
-///         cell's records for the node come from the cells contract, every other key from the node's own name.
+///         cell's records for the node come from the cells contract only, every other key from the node's own name.
 contract DedanResolver is Multicallable, AddrResolver, TextResolver, DNSResolver {
     IPermissionedRegistry public immutable REGISTRY;
     /// @notice namehash of the parent name, e.g. `dedan.eth`.
@@ -57,13 +57,18 @@ contract DedanResolver is Multicallable, AddrResolver, TextResolver, DNSResolver
         return labelId == 0 ? bytes32(0) : NameCoder.namehash(PARENT_NODE, bytes32(labelId));
     }
 
+    /// @notice On an alias name, the keys the cells contract owns (`dedan.latency`, `dedan.votes`, `dedan.cell`,
+    ///         `dedan.node`) come from it alone, even when empty; every other key from the node's own name.
     function text(bytes32 node, string calldata key) external view override returns (string memory) {
         string memory own = versionable_texts[recordVersions[node]][node][key];
         if (bytes(own).length != 0 || labelOf[node] != 0) return own;
         bytes32 identity = _identityOf(node);
         if (identity == bytes32(0)) return own;
-        string memory fromCell = cells.text(node, key);
-        if (bytes(fromCell).length != 0) return fromCell;
+        bytes32 k = keccak256(bytes(key));
+        if (
+            k == keccak256("dedan.latency") || k == keccak256("dedan.votes") || k == keccak256("dedan.cell")
+                || k == keccak256("dedan.node")
+        ) return cells.text(node, key);
         return versionable_texts[recordVersions[identity]][identity][key];
     }
 

@@ -48,6 +48,8 @@ contract DedanCells is ITextResolver, IERC1155Receiver {
 
     mapping(uint64 cell => uint256[] labelIds) internal _members;
     mapping(uint64 cell => mapping(uint256 labelId => uint32 index1)) internal _memberIndex;
+    /// @dev The cells a node is a member of, so the registry can remove it from all of them.
+    mapping(uint256 labelId => uint64[] cells) internal _cellsOf;
     /// @dev Two words of sixteen 16-bit counters: bucket b lives in word b / 16 at bit (b % 16) * 16.
     mapping(uint64 cell => mapping(uint256 labelId => mapping(uint32 epoch => uint256[2]))) internal _hist;
     mapping(address human => mapping(uint64 cell => mapping(uint256 labelId => Vote))) public lastVote;
@@ -76,6 +78,8 @@ contract DedanCells is ITextResolver, IERC1155Receiver {
     error NotAttester();
     error NotMember();
     error TooSoon();
+    error NotRegistry();
+    error BadCell(uint64 cell);
 
     constructor(DedanRegistry registry) {
         REGISTRY = registry;
@@ -84,12 +88,14 @@ contract DedanCells is ITextResolver, IERC1155Receiver {
     // ---- membership ---------------------------------------------------------------------------
 
     /// @notice A node's owner adds it to the cells it serves; the first member of a cell registers the cell name.
+    ///         Cells are H3 resolution-2 indexes (`LibCell.isCell`).
     function join(string calldata label, uint64[] calldata cells) external {
         uint256 labelId = LibLabel.id(label);
         if (REGISTRY.getOwner(labelId) != msg.sender) revert NotNodeOwner();
         if (!REGISTRY.isNodeActive(label)) revert NodeInactive();
         for (uint256 i; i < cells.length; ++i) {
             uint64 cell = cells[i];
+            if (!LibCell.isCell(cell)) revert BadCell(cell);
             if (!registered[cell]) {
                 registered[cell] = true;
                 cellOfNode[REGISTRY.registerCell(cell)] = cell;
@@ -97,6 +103,7 @@ contract DedanCells is ITextResolver, IERC1155Receiver {
             if (_memberIndex[cell][labelId] != 0) continue;
             _members[cell].push(labelId);
             _memberIndex[cell][labelId] = uint32(_members[cell].length);
+            _cellsOf[labelId].push(cell);
             aliasOf[aliasNode(cell, labelId)] = Alias(cell, labelId);
             emit Joined(cell, bytes32(labelId));
         }
@@ -105,19 +112,29 @@ contract DedanCells is ITextResolver, IERC1155Receiver {
     function leave(string calldata label, uint64[] calldata cells) external {
         uint256 labelId = LibLabel.id(label);
         if (REGISTRY.getOwner(labelId) != msg.sender) revert NotNodeOwner();
+        uint64[] storage mine = _cellsOf[labelId];
         for (uint256 i; i < cells.length; ++i) {
             uint64 cell = cells[i];
-            uint32 idx = _memberIndex[cell][labelId];
-            if (idx == 0) continue;
-            uint256[] storage list = _members[cell];
-            uint256 last = list[list.length - 1];
-            list[idx - 1] = last;
-            _memberIndex[cell][last] = idx;
-            list.pop();
-            delete _memberIndex[cell][labelId];
-            delete aliasOf[aliasNode(cell, labelId)];
-            emit Left(cell, bytes32(labelId));
+            if (_memberIndex[cell][labelId] == 0) continue;
+            _drop(cell, labelId);
+            for (uint256 j;; ++j) {
+                if (mine[j] == cell) {
+                    mine[j] = mine[mine.length - 1];
+                    mine.pop();
+                    break;
+                }
+            }
         }
+    }
+
+    /// @notice Called by the registry when a node is withdrawn: it leaves every cell it is a member of.
+    function removeNode(uint256 labelId) external {
+        if (msg.sender != address(REGISTRY)) revert NotRegistry();
+        uint64[] storage mine = _cellsOf[labelId];
+        for (uint256 i; i < mine.length; ++i) {
+            _drop(mine[i], labelId);
+        }
+        delete _cellsOf[labelId];
     }
 
     // ---- attestations -------------------------------------------------------------------------
@@ -212,8 +229,9 @@ contract DedanCells is ITextResolver, IERC1155Receiver {
     // ---- ENS records --------------------------------------------------------------------------
 
     /// @notice Text records of the cell names and of the `<label>.<cell>` alias names.
-    ///         Cell: `dedan.nodes` (member labels, comma-separated), `dedan.latency.<label>`, `dedan.votes.<label>`,
-    ///         `dedan.cell`. Alias: `dedan.latency`, `dedan.votes`, `dedan.cell`, `dedan.node`. Empty otherwise.
+    ///         Cell: `dedan.nodes` (member labels, comma-separated), `dedan.latency.<label>`, `dedan.votes.<label>`
+    ///         (members only), `dedan.cell`. Alias: `dedan.latency`, `dedan.votes`, `dedan.cell`, `dedan.node`.
+    ///         Empty otherwise.
     function text(bytes32 node, string calldata key) external view returns (string memory) {
         uint64 cell = cellOfNode[node];
         if (cell != 0) {
@@ -252,6 +270,18 @@ contract DedanCells is ITextResolver, IERC1155Receiver {
 
     // ---- internals ----------------------------------------------------------------------------
 
+    function _drop(uint64 cell, uint256 labelId) internal {
+        uint32 idx = _memberIndex[cell][labelId];
+        uint256[] storage list = _members[cell];
+        uint256 last = list[list.length - 1];
+        list[idx - 1] = last;
+        _memberIndex[cell][last] = idx;
+        list.pop();
+        delete _memberIndex[cell][labelId];
+        delete aliasOf[aliasNode(cell, labelId)];
+        emit Left(cell, bytes32(labelId));
+    }
+
     function _bump(uint64 cell, uint256 labelId, uint32 epoch, uint8 bucket, bool up) internal {
         uint256[2] storage words = _hist[cell][labelId][epoch];
         uint256 shift = (bucket % 16) * 16;
@@ -267,7 +297,9 @@ contract DedanCells is ITextResolver, IERC1155Receiver {
         words[bucket / 16] = (w & ~(uint256(0xffff) << shift)) | (c << shift);
     }
 
+    /// @dev Members only, like `snapshot`: a node that left keeps its votes for two days but no record.
     function _median(uint64 cell, uint256 labelId, bool votesNotMs) internal view returns (string memory) {
+        if (_memberIndex[cell][labelId] == 0) return "";
         (uint32 ms, uint32 votes) = median(cell, labelId);
         if (votes == 0) return "";
         return Strings.toString(uint256(votesNotMs ? votes : ms));

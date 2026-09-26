@@ -111,7 +111,7 @@ impl fmt::Display for AccountId {
     }
 }
 
-/// An H3 cell index (resolution 5, see [`crate::geo`]).
+/// An H3 cell index (resolution 2, see [`crate::geo`]).
 #[derive(
     Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize, Default,
 )]
@@ -187,6 +187,14 @@ impl Availability {
             Availability::P999 => 0.999,
         }
     }
+
+    /// The target in basis points, as the on-chain price table keys tiers.
+    pub fn bps(self) -> u32 {
+        match self {
+            Availability::P99 => 9900,
+            Availability::P999 => 9990,
+        }
+    }
 }
 
 /// Node → all resolvers, every 10 s. The endpoint and the location are ENS records, not heartbeat fields.
@@ -226,6 +234,8 @@ pub enum FailureClass {
     Connect,
     Tls,
     Timeout,
+    /// A 4xx for an asset of the customer's own list: the node's only when another member served it.
+    Http4xx,
     Http5xx,
     WrongBytes,
 }
@@ -308,6 +318,9 @@ pub struct CertRequest {
     pub account_id: AccountId,
     pub hostnames: Vec<String>,
     pub csr_pem: String,
+    /// The ARI identifier (`CertIssued.ari_id`) of the certificate this order renews.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub replaces: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

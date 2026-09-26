@@ -3,9 +3,10 @@
 //! response with a random hourly key that its hot key reveals on chain, heartbeating to the resolvers, and
 //! serving the class blob and the endpoint challenge under `/.well-known/dedan/`.
 //!
-//! Accounts come from the control plane's signed configs (full sync at start, then its event stream; the
-//! account file when no control plane is configured); purges bump the account's cache generation; a
-//! certificate per SAN set is obtained through the control plane and served per SNI (`tls`).
+//! Accounts come from the configs their account keys signed, relayed by the control plane (full sync at start,
+//! then its event stream; the account file until it answers, or when none is configured), with the account's
+//! cache rules; purges bump the account's cache generation; a certificate per SAN set is obtained through the
+//! control plane and served per SNI (`tls`).
 //! ponytail: the per-account rate cap is the one §5 item still missing.
 
 mod control;
@@ -40,6 +41,8 @@ type Error = Box<dyn std::error::Error + Send + Sync>;
 sol! {
     #[sol(rpc)]
     interface IDedanRegistry {
+        error AlreadyRevealed();
+        error RevealTooEarly();
         function revealKey(string label, uint64 hour, bytes32 kHour) external;
     }
 }
@@ -51,26 +54,35 @@ pub fn unix_now() -> u64 {
         .unwrap_or(0)
 }
 
-/// Where a Host goes: the account, its origin (address, TLS, Host header) and the cache generation.
+/// Where a Host goes: the account, its origin (address, TLS, Host header), its cache rules and the cache
+/// generation.
 #[derive(Debug, Clone)]
 pub struct Route {
     pub account: String,
     pub origin_addr: String,
     pub origin_tls: bool,
     pub origin_host: String,
+    pub rules: CacheRules,
     pub generation: u64,
 }
 
-/// The hourly token keys: random, kept for the current and the next hour, revealed on chain after the hour
-/// (or at once on the devnet, `DEDAN_REVEAL_IMMEDIATELY`, so tokens verify without waiting an hour).
+/// The hourly token keys (§7), each derived from the node's hot key and the hour:
+/// `HMAC-SHA256(hot key, "<hour>|token-key:<label>")`. The registry takes one reveal per hour, so a restarted node
+/// must mint with the key it already revealed, which a random key would not be; a revealed key tells nothing
+/// about any other hour's. Kept for the current and the next hour, revealed on chain after the hour (or at once
+/// on the devnet, `DEDAN_REVEAL_IMMEDIATELY`, so tokens verify without waiting an hour).
 pub struct Keys {
+    secret: [u8; 32],
+    label: String,
     keys: Mutex<BTreeMap<u64, [u8; 32]>>,
     revealed: Mutex<BTreeMap<u64, bool>>,
 }
 
 impl Keys {
-    fn new() -> Self {
+    fn new(secret: [u8; 32], label: &str) -> Self {
         Self {
+            secret,
+            label: label.to_owned(),
             keys: Mutex::new(BTreeMap::new()),
             revealed: Mutex::new(BTreeMap::new()),
         }
@@ -78,9 +90,9 @@ impl Keys {
 
     pub fn key_for(&self, hour: u64) -> [u8; 32] {
         let mut keys = self.keys.lock().expect("keys");
-        *keys
-            .entry(hour)
-            .or_insert_with(rand::random::<[u8; 32]>)
+        *keys.entry(hour).or_insert_with(|| {
+            dedan_core::token::mac(&self.secret, hour, &format!("token-key:{}", self.label))
+        })
     }
 
     fn pending_reveals(&self, hour_now: u64, immediately: bool) -> Vec<(u64, [u8; 32])> {
@@ -110,8 +122,12 @@ pub struct Node {
     routes: RwLock<HashMap<String, Route>>,
     /// The cache generation per account: a purge bumps it and every key of the account changes.
     generations: RwLock<HashMap<String, u64>>,
-    /// The account keys from the configs, what purges must be signed with.
+    /// The account keys registered on chain (cached), what configs and purges must be signed with.
     account_keys: RwLock<HashMap<String, Address>>,
+    /// The config version applied per account: only a higher one replaces it.
+    versions: RwLock<HashMap<String, u64>>,
+    /// The seq of the last control-plane event applied, sent back as `Last-Event-ID` on a reconnect.
+    last_seq: AtomicU64,
     key: PrivateKeySigner,
     provider: DynProvider,
     dep: Deployment,
@@ -167,6 +183,15 @@ impl Node {
                     Ok(_) => warn!(hour = h, "revealKey reverted"),
                     Err(e) => warn!(hour = h, error = %e, "revealKey receipt"),
                 },
+                // the first reveal of an hour stands: this process's (a receipt that never arrived) or one made
+                // before a restart, whose key this process no longer has
+                Err(e) if e.as_decoded_error::<IDedanRegistry::AlreadyRevealed>().is_some() => {
+                    self.keys.mark_revealed(h);
+                    warn!(hour = h, "key already revealed for this hour (before a restart?); tokens minted with another key for it will not verify");
+                }
+                Err(e) if e.as_decoded_error::<IDedanRegistry::RevealTooEarly>().is_some() => {
+                    info!(hour = h, "the hour has not ended at the chain's clock and early reveals are off; retrying later");
+                }
                 Err(e) => warn!(hour = h, error = %e, "revealKey failed"),
             }
         }
@@ -280,26 +305,34 @@ pub fn parse_origin(url: &str) -> Result<(String, bool, String), Error> {
     Ok((format!("{host}:{port}"), tls, host))
 }
 
+/// A config's routes: each of its hostnames to its first origin (or the override) with its cache rules.
+pub fn routes_of(c: &AccountConfig, origin_override: Option<&str>) -> Result<Vec<(String, Route)>, Error> {
+    let Some(origin) = c.origins.first() else { return Ok(vec![]) };
+    let url = origin_override.unwrap_or(&origin.url);
+    if url.is_empty() {
+        return Ok(vec![]);
+    }
+    let (addr, tls, host) = parse_origin(url)?;
+    Ok(c.domains
+        .iter()
+        .map(|h| {
+            let route = Route {
+                account: c.account_id.0.clone(),
+                origin_addr: addr.clone(),
+                origin_tls: tls,
+                origin_host: origin.host_header.clone().unwrap_or_else(|| host.clone()),
+                rules: c.cache_rules.clone(),
+                generation: 0,
+            };
+            (h.to_lowercase(), route)
+        })
+        .collect())
+}
+
 fn routes_from(accounts: &[AccountCfg], origin_override: Option<&str>) -> Result<HashMap<String, Route>, Error> {
     let mut routes = HashMap::new();
     for a in accounts {
-        let origin = origin_override.unwrap_or(&a.origin);
-        if origin.is_empty() {
-            continue;
-        }
-        let (addr, tls, host) = parse_origin(origin)?;
-        for h in &a.hostnames {
-            routes.insert(
-                h.to_lowercase(),
-                Route {
-                    account: a.label.clone(),
-                    origin_addr: addr.clone(),
-                    origin_tls: tls,
-                    origin_host: host.clone(),
-                    generation: 0,
-                },
-            );
-        }
+        routes.extend(routes_of(&a.to_config(0), origin_override)?);
     }
     Ok(routes)
 }
@@ -338,11 +371,13 @@ fn main() -> Result<(), Error> {
         class: Class::parse_record(&get("DEDAN_CLASS", "100M")).unwrap_or(Class::M100),
         version: format!("dedan-node {}", env!("CARGO_PKG_VERSION")),
         zone: get("DEDAN_ZONE", "dedan-cdn.test"),
-        keys: Keys::new(),
+        keys: Keys::new(key.to_bytes().0, &label.0),
         certs: Arc::new(tls::CertStore::default()),
         routes: RwLock::new(routes),
         generations: RwLock::new(HashMap::new()),
         account_keys: RwLock::new(HashMap::new()),
+        versions: RwLock::new(HashMap::new()),
+        last_seq: AtomicU64::new(0),
         provider: ProviderBuilder::new().wallet(key.clone()).connect_http(rpc).erased(),
         key,
         dep,
@@ -383,8 +418,39 @@ fn main() -> Result<(), Error> {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
+
+    /// A node that reaches nothing: its RPC and control plane are unreachable addresses.
+    pub(crate) fn node() -> Node {
+        let zero = Address::ZERO;
+        let dep = serde_json::json!({
+            "chainId": 31337, "usdc": zero, "dedanRegistry": zero, "dedanCells": zero, "universalResolver": zero,
+            "settlement": zero, "governance": zero, "aggregator": zero, "countersigner": zero,
+        });
+        Node {
+            label: NodeId::new("test"),
+            class: Class::M100,
+            version: String::new(),
+            zone: "dedan-cdn.test".into(),
+            keys: Keys::new([1u8; 32], "test"),
+            certs: Arc::new(tls::CertStore::default()),
+            routes: RwLock::new(HashMap::new()),
+            generations: RwLock::new(HashMap::new()),
+            account_keys: RwLock::new(HashMap::new()),
+            versions: RwLock::new(HashMap::new()),
+            last_seq: AtomicU64::new(0),
+            key: PrivateKeySigner::random(),
+            provider: ProviderBuilder::new().connect_http("http://127.0.0.1:9".parse().unwrap()).erased(),
+            dep: serde_json::from_value(dep).unwrap(),
+            resolvers: vec![],
+            cp_url: None,
+            origin_override: None,
+            reveal_immediately: false,
+            nonce: AtomicU64::new(0),
+            http: reqwest::Client::new(),
+        }
+    }
 
     #[test]
     fn origins_parse() {
@@ -398,9 +464,11 @@ mod tests {
 
     #[test]
     fn keys_reveal_after_the_hour_unless_told_otherwise() {
-        let k = Keys::new();
+        let k = Keys::new([7u8; 32], "fra");
         let a = k.key_for(10);
         assert_eq!(k.key_for(10), a, "stable within the hour");
+        assert_eq!(Keys::new([7u8; 32], "fra").key_for(10), a, "a restarted node mints with the key it revealed");
+        assert_ne!(Keys::new([8u8; 32], "fra").key_for(10), a, "another hot key, another key");
         k.key_for(11);
         assert_eq!(k.pending_reveals(10, false), vec![], "nothing ended yet");
         assert_eq!(k.pending_reveals(11, false).len(), 1, "hour 10 ended");

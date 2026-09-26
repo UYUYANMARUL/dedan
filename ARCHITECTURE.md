@@ -1,6 +1,6 @@
-# Dedan — Decentralized CDN Architecture (v3)
+# Dedan — Decentralized CDN Architecture (v3.2)
 
-Sep 26, 2026 · @Ege · v3.1: ENSv2 names, records and Enhanced Access Control as the identity layer. Appendix A lists every change from v1, v2 and v3 with the reason. Appendix B lists the attacks the design was checked against.
+Sep 26, 2026 · @Ege · v3.1: ENSv2 names, records and Enhanced Access Control as the identity layer. v3.2: cells as ENS names, the latency map kept on chain by `DedanCells`. Appendix A lists every change from v1, v2 and v3 with the reason. Appendix B lists the attacks the design was checked against. `FIX.md` lists what the 2026-09-26 audit of the build against this document found and how each item was settled.
 
 ## 1. Overview and design principles
 
@@ -10,7 +10,7 @@ One fact drives the design: third parties can measure a node's quality (uptime, 
 
 - **Money = public assignment × audited quality.** A public, deterministic function assigns nodes to customer slots from on-chain and signed data; auditors measure how well each slot was served. Nothing a node or a resolver reports about itself touches money.
 - Consumption is managed by routing (per-domain rate caps, load steering inside a slot set), never accounted for.
-- **Location is measured, never declared.** Verified humans attest round trips to nodes from their own location cells, to the registry contract; that map decides which nodes an account gets and which one a client is sent to. A node is where the humans measure it to be.
+- **Location is measured, never declared.** Verified humans attest round trips to nodes from their own location cells, to the cells contract (`DedanCells`), which keeps the medians; that map decides which nodes an account gets and which one a client is sent to. A node is where the humans measure it to be.
 - **A node is an ENS name, and every permission is a role.** Nodes are subnames of `dedan.eth` in Dedan's ENSv2 registry; their endpoint and config are the name's records; who may register, attest, probe, sign or slash is an Enhanced Access Control role on that registry, granted to World ID-verified humans or by governance.
 - Probes are indistinguishable from real users: same paths users fetch, same client behaviour, no marker. A node cannot favour auditors because it cannot find them.
 - Every probe result carries proof that the fetch happened (a token only the node could have minted), so auditors cannot invent results either.
@@ -27,10 +27,11 @@ flowchart LR
   N -->|miss| O[Customer origin]
   A[Auditors<br/>World ID + stake] -->|probes, same as users| N
   A -->|signed results + fetch tokens| G[Aggregator]
-  A -->|RTT attestations from H3 cells| G
-  G -->|hourly latency map| R
+  A -->|RTT attestations per H3 cell| CELLS[DedanCells<br/>the latency map]
+  CELLS -.->|event sync: votes and medians| R
+  CELLS -.->|event sync| G
   N -->|heartbeats| R
-  N -->|hourly token keys| G
+  N -->|hourly token keys, revealKey| REG
   G -->|daily roots, countersigned| S[Settlement contract]
   REG[Registry contract] -.->|event sync| R
   REG -.->|event sync| A
@@ -45,18 +46,19 @@ Solid arrows are the live path; dotted arrows are periodic syncs or streams.
 
 ## 2. Actors and components
 
-Seven components, each with one job.
+Nine components, each with one job.
 
 | Component | Runs where | Job | Reads | Writes |
 |---|---|---|---|---|
-| Dedan registry (`DedanRegistry`, an ENSv2 `PermissionedRegistry`) | World Chain | Identity root: the `dedan.eth` subname registry with Dedan's rules. Node names as tokens, roles as EAC bitmaps, stakes, World ID checks, `attest` and `revealKey` as events | World ID verifier | `registerOperator/Attester/Auditor`, `registerNode`, `grantRoles` (owner → signer keys), unbond, withdraw, `attest`, `revealKey`; suspend and slash by governance |
-| Settlement contract | World Chain | Customer balances, daily cumulative payout and bill roots, dispute window, withdrawal delay, signer bonds | Countersigned roots | deposit, request/execute withdraw, claim, publishRoot, voidRoot |
+| Dedan registry (`DedanRegistry`, an ENSv2 `PermissionedRegistry`) | World Chain | Identity root: the `dedan.eth` subname registry with Dedan's rules. Node names as tokens, roles as EAC bitmaps, stakes, World ID checks, `revealKey` as events (one per node and hour, after the hour), cell names with itself as their subregistry | World ID verifier | `registerOperator/Attester/Auditor`, `registerNode`, `grantRoles` (owner → signer keys), unbond, withdraw (which also removes the node from its cells and clears its records), `revealKey`; suspend and slash by governance |
+| Cells contract (`DedanCells`) | World Chain | The latency map on chain: nodes join cells (`<h3 hex>.dedan.eth`, resolution 2), humans `attest(cell, batch)` once a minute per cell, one vote per human per node per cell in per-day histograms; the medians are the records of `<label>.<cell>.dedan.eth` | The registry (roles, owners, activity) | `join`, `leave`, `attest`; `Joined`, `Left`, `Attested` events |
+| Settlement contract | World Chain | Customer balances, daily cumulative payout and bill roots, dispute window, withdrawal delay, signer bonds, the price table per tier | Countersigned roots, the registrar's account signatures | createAccount (with the registrar's signature), deposit, request/execute withdraw, claim, publishRoot (bonded signers only), voidRoot |
 | ENSv2 tree | World Chain (Dedan's own deployment of the ENSv2 contracts; bridged to canonical L1 `dedan.eth` once ENSv2 reaches mainnet) | Root → `eth` → `dedan` registries, the node resolver (`DedanResolver`: `addr`, `text`, DNS records, `multicall`), the Universal Resolver every client resolves through | — | Governance registers `eth` and `dedan`; node owners write their records |
 | Node | Operator hardware, anywhere; `<label>.dedan.eth` | Serve HTTPS for assigned accounts, cache, fetch from origin, mint fetch tokens | Configs, purges, sealed origin secrets, issued certificates, its own ENS records | Heartbeats, CSRs, hourly `revealKey` on chain; its operator writes the records |
 | Resolver | 3–5 operators (`ROLE_RESOLVER_OPERATOR`, permissioned in v1) | Authoritative DNS for `dedan-cdn.net`; answer from the public slot sets ordered by the latency map; serve ACME TXT records | Registry events, ENS records through the Universal Resolver, configs, heartbeats, GeoIP | DNS answers |
-| Auditor | World ID–verified person, anywhere (`ROLE_ATTESTER`; `ROLE_AUDITOR` with stake) | Two jobs: attest round trips to nodes from their own location cell, to the registry (the latency map), and act as a synthetic user on assigned probes measuring availability, integrity, throughput and resolver conformance | Registry events, public configs, asset lists, origin digests | `attest` transactions and signed probe results, both with fetch tokens |
+| Auditor | World ID–verified person, anywhere (`ROLE_ATTESTER`; `ROLE_AUDITOR` with stake) | Two jobs: attest round trips to the members of their own location cell, to `DedanCells` (the latency map), and act as a synthetic user on assigned probes measuring availability, integrity, throughput and resolver conformance | Registry events, public configs, asset lists, origin digests | `attest` transactions and signed probe results, both with fetch tokens |
 | Aggregator | Off-chain; one operator plus one independent countersigner in v1 | Deterministic scoring: latency map, slot assignment, quality, SLA multipliers, bills, payouts, evidence | Probe results and asset samples from auditors; attestations, key reveals, names, roles and stakes from the chain; price table | Inputs to IPFS, daily roots on-chain, submission receipts |
-| Control plane | API + CLI (web UI later) | Turn customer intent into account-signed configs; verify domains; run ACME orders for nodes; relay purges; publish asset lists and origin digests | Contract balances, origins | Signed configs, purges, TXT records, certificates, digests, SSE stream |
+| Control plane | API + CLI (web UI later) | Relay the configs customers sign with their account keys; sign account registrations as the registrar; verify domains; run ACME orders for nodes; relay purges; publish asset lists and origin digests | Account keys and balances on chain, origins | Account registrations, relayed configs and purges, TXT records, certificates, digests, SSE stream with replay |
 
 Trust, from most to least: settlement contract (code) → auditors (World ID + stake, statistically cross-checked, results carry fetch proofs) → nodes (stake, probed) → resolvers (stake; no money power: they answer from a set anyone can recompute, and auditors check that they do) → control plane (relays and orders; everything it emits is verifiable against an account key or its published key) → customers (prepaid, signed configs) → end users (untrusted).
 
@@ -137,10 +139,10 @@ sequenceDiagram
 ### The resolver's decision (steps 4–5)
 
 1. Parse the query name: label `acme` → account config (active, tier, verified hostnames).
-2. Locate the client: EDNS Client Subnet if present, else the recursive resolver's IP, via GeoIP to a point, snapped to an H3 cell (resolution 5, about 17 km). Echo the ECS option with a scope in the answer (Google Public DNS stops sending ECS otherwise; Cloudflare never sends it, so the fallback matters).
+2. Locate the client: EDNS Client Subnet if present, else the recursive resolver's IP, via GeoIP to a point, snapped to an H3 cell (resolution 2, about 300 km). Echo the ECS option with a scope in the answer (Google Public DNS stops sending ECS otherwise; Cloudflare never sends it, so the fallback matters).
 3. Take the account's **slot set** (§6): the `S` nodes assigned to this account today by the public assignment function, and keep the members that are up (fresh heartbeat, not draining).
 4. Order them by the latency map for the client's cell (§6): the median round trip verified humans measured from that cell, ring-searching neighbouring cells until enough humans have measured. Return 2–3; members within 20 ms of each other are ordered by self-reported spare capacity. TTL 30–60 s.
-5. Cold start: when no covered cell exists within three rings, order by great-circle distance from the client point to each member's estimated location (the centroid of the cells where it measures best, or the operator's declared approximate location until any attestation exists). That declared location never touches money.
+5. Cold start: when no covered cell exists within three rings, order by great-circle distance from the client point to each member's declared approximate location (`dedan.location`; ordering by the map's own estimate, the centroid of the cells where the node measures best, is a later refinement). That declared location never touches money.
 6. Nothing is logged for settlement. Counters exist only for the operator's own monitoring.
 
 ### The node's decision (step 7)
@@ -163,7 +165,7 @@ A node is one Rust binary built on Pingora: a reverse proxy with an HTTP cache, 
 | Router (`ProxyHttp`) | SNI/Host → account → origin, class, generation | Config table updated from the control-plane stream; 421 default |
 | Cache | `pingora-cache` with a disk `Storage` (file per key + metadata, atomic rename, streaming writes), cache lock = single-flight, stale-while-revalidate, stale-if-error up to 24 h, LRU eviction | OS page cache is the hot tier in v1; a memory tier only if measured. pingora-cache's API is declared volatile, so the version is pinned |
 | Origin fetcher | Connection pooling to origins, origin auth header from the sealed secret, honours `Cache-Control`, `ETag`, `Vary`, object size cap | Secret decrypted with the node's x25519 key, held in memory only |
-| Token minter | Adds `X-Dedan-Node: <label>.<minute>.<hmac>` to every response, `hmac = HMAC(k_hour, minute ‖ client /24)` | One HMAC per response. `k_hour` is random per hour and revealed on chain (`revealKey`) after the hour ends (§7); binding the /24 rather than the address keeps attestations publishable |
+| Token minter | Adds `X-Dedan-Node: <label>.<minute>.<net>.<hmac>` to every response, `hmac = HMAC(k_hour, minute ‖ client /24)`, `<net>` = that /24 (or /48) as the node saw it, in hex | One HMAC per response. `k_hour = HMAC(hot key, hour)`: unpredictable without the node's hot key, the same after a restart (the registry takes one reveal per hour), revealed on chain (`revealKey`) after the hour ends (§7); binding the /24 rather than the address keeps attestations publishable |
 | Rate cap | Per-account aggregate Mbps cap = the account's class | `pingora-limits`; the node's own counters decide, nobody else sees them |
 | Purger | Signed purges: URL → `Storage::purge(key)`; account or prefix → bump the account's generation in the cache key | Purge ids stored to reject replay; prefix purge = whole-account bump in v1 |
 | Config client | SSE stream from the control plane with per-account sequence numbers; replays from the last seq on reconnect; full sync every 60 s | Verifies every config against the account key and every hostname's CNAME |
@@ -205,7 +207,7 @@ flowchart TD
 
 1. Read the deployment (contract addresses, control-plane key, resolver list) once at start.
 2. Replay `DedanRegistry` and `DedanCells` events from the last seen block into the identity cache: names, owners, stakes, roles, suspensions, key reveals, cell membership, attestations; keep the block number and its time (the chain's clock, which the map's window follows). Read every node's records through the Universal Resolver (`resolve(name, data)` per ENSIP-10): `addr`, `dedan.*` text, DNS A/AAAA.
-3. Consume the control-plane SSE stream: account configs (verify account-key signature and version), delegations, suspensions, signed ACME TXT records. On reconnect, replay from the last seq.
+3. Take the account configs the control plane relays (a full read every sync): a config counts only with the signature of the account key registered on the Settlement contract and a version above the one held. Read each account's balance and its tier's price from the Settlement contract and stop answering an account whose effective balance (§8) cannot cover four periods at list price. Delegations and control-plane-signed ACME TXT records are M4.
 4. Mirror the latency map from the chain's `Attested` events with the contract's own rules (below) and recompute today's slot assignment from yesterday's published quality. Every resolver, auditor and the aggregator hold the contract's map and the same sets from the same chain, without asking the contract; the token and location checks the contract cannot make produce evidence.
 5. Re-verify every hostname's CNAME hourly; drop hostnames that no longer point at their account.
 
@@ -219,8 +221,8 @@ Nobody declares where a node is. The map is the state of `DedanCells`, written b
 - **Histograms and medians**: votes land in the day's histogram of 32 buckets of 8 ms (the last one open-ended), two storage slots per cell, node and day. The cell's record for a node is the lower-middle median over today's and yesterday's votes, as the bucket midpoint (`DedanCells.median`, the `dedan.latency` text record of `<label>.<cell>.dedan.eth`). Old measurements age out with the days.
 
 ```
-rank(cell)      = the cell's members ordered by median, once some member has k votes           # k = 3 minimum, 5 target
-                  (1 on the devnet); a cell without k votes merges the histograms of grid_disk(cell, r) for r = 1..2
+rank(cell)      = the cell's current members with k votes each, ordered by median           # k = 3 minimum, 5 target
+                  (1 on the devnet); a cell without k votes merges the histograms of grid_disk(cell, r) for r = 1..3
 location(node)  = centroid of the cells where the node ranks best; the operator's declared approximate location
                   only while the node has no votes at all
 ```
@@ -234,12 +236,14 @@ Each account has one **slot set** of `S` nodes, `S` being its node-count tier. T
 ```
 assign(day) :
   seed      = hash(L1 block at 00:00 UTC of day)
-  eligible  = registered nodes with status active, class conclusive ≥ account class (yesterday's coordinated
-              throughput probe; an inconclusive probe leaves the node at its highest conclusive class, 100M when
-              none), entry audit passed, at least one map row, not on the account's operator denylist (or on its
-              allowlist if one is set), stake ≥ account min_node_stake
+  eligible  = registered nodes with status active (not suspended, not unbonding, minimum stake held), class
+              conclusive ≥ account class (yesterday's coordinated throughput probe; an inconclusive probe leaves the
+              node at its highest conclusive class, 100M when none; never the class a node declares), entry audit
+              passed, not on the account's operator denylist (or on its allowlist if one is set), stake ≥ account
+              min_node_stake; a node without a map row costs uncovered_rtt everywhere, so measured nodes win
   for a in accounts, in seeded order:
-    keep yesterday's members that are still eligible and had quality ≥ 0.9 yesterday        # sticky
+    keep yesterday's members that are still eligible, had quality ≥ 0.9 yesterday, and pass    # sticky
+    the same /24 and admission checks as new members (yesterday = the aggregator's published period)
     repeat until |set| = S:
       add the eligible node that most reduces Σ_{covered cells} min_{member} rtt(cell, member)   # greedy k-median
       subject to: at most one node per /24, prefer distinct ASNs within the set                 # no Sybil replication
@@ -247,13 +251,13 @@ assign(day) :
     rotate out at most one kept member per day when a replacement improves the sum by > 10%   # newcomers get in
 ```
 
-Properties: idle capacity earns nothing (only slots pay); a node cannot raise its share by anything it reports (load, class, uptime and location all come from audits, attestations or the chain); an operator with ten identities on one box gains nothing inside a set (one per /24) and fails the coordinated class probe across sets (§7); a node nobody has measured is never chosen; caches stay warm because sets are sticky; every new (node, account) pair costs one certificate issuance, and stickiness keeps that under the CA's weekly limits (§10).
+Properties: idle capacity earns nothing (only slots pay); a node cannot raise its share by anything it reports (load, class, uptime and location all come from audits, attestations or the chain); an operator with ten identities on one box gains nothing inside a set (one per /24) and fails the coordinated class probe across sets (§7); a node nobody has measured costs the uncovered-cell penalty everywhere, so it is chosen only when no measured node fits; caches stay warm because sets are sticky; every new (node, account) pair costs one certificate issuance, and stickiness keeps that under the CA's weekly limits (§10).
 
 Answers order the up members of the set by `rank(cell)` for the client's cell and return 2–3; members within 20 ms of each other are ordered by heartbeat spare capacity. That choice affects which member carries more load, never who gets paid, so a node that lies about its load only earns itself more traffic and worse probe results.
 
 ### Endpoint verification
 
-A name's DNS record is answered only after the resolver has fetched `https://<ip>/.well-known/dedan/challenge/<nonce>` with SNI `<label>.node.dedan-cdn.net` and received the nonce signed by one of the name's signer keys. One endpoint per node; an IP claimed by two names is served for neither until one changes its record. Auditors identify the node that served them from the response token (§7), never from the IP alone.
+A name's DNS record (A and AAAA alike) is answered only after the resolver has fetched `http://<ip>:<port>/.well-known/dedan/challenge/<nonce>` and received the nonce signed by one of the name's signer keys; the signature over a fresh nonce is the proof, so plain HTTP suffices. One endpoint per node; an address two names proved is served for neither until one changes its record. Auditors identify the node that served them from the response token (§7), never from the IP alone.
 
 ### Records served
 
@@ -272,17 +276,17 @@ Each operator runs the same software with its own key. Recursives spread queries
 
 ## 7. Auditors
 
-Auditors are the only source of the location and quality numbers that money depends on. Each auditor is a World ID–verified person (one human, one account per role) running one app from wherever they are. They produce two kinds of record: **attestations**, opportunistic round-trip measurements from their own location cell, sent to `DedanRegistry.attest` and stored as events, which build the latency map (§6); and **probe results** from assigned probes that measure quality. Probes are assigned by a verifiable schedule so no auditor picks its targets; probes look like user traffic so nodes cannot favour them; every successful probe and every attestation carries a token so auditors cannot invent them. `registerAttester(proof)` grants `ROLE_ATTESTER` for a World ID proof alone; `registerAuditor(proof, stake)` grants `ROLE_AUDITOR` with the governance minimum stake, which assigned probes need.
+Auditors are the only source of the location and quality numbers that money depends on. Each auditor is a World ID–verified person (one human, one account per role) running one app from wherever they are. They produce two kinds of record: **attestations**, opportunistic round-trip measurements from their own location cell, sent to `DedanCells.attest` and kept there as per-day histograms, which are the latency map (§6); and **probe results** from assigned probes that measure quality. Probes are assigned by a verifiable schedule so no auditor picks its targets; probes look like user traffic so nodes cannot favour them; every successful probe and every attestation carries a token so auditors cannot invent them. `registerAttester(proof)` grants `ROLE_ATTESTER` for a World ID proof alone; `registerAuditor(proof, stake)` grants `ROLE_AUDITOR` with the governance minimum stake, which assigned probes need.
 
 **Reaching a specific node without being identifiable**: connect to the node's IP with SNI and Host set to the customer hostname. That is exactly what a user whose recursive resolver returned that IP does.
 
 **What to fetch**: not a fixed list. Each account has an **asset list**: the customer's cacheable asset inventory (from a manifest URL the customer maintains, or crawled by the control plane from the customer's declared entry pages). The control plane fetches a seeded sample of it from the origin every hour and publishes signed digests (decoded body sha256, current and previous, plus origin ETag). Auditors sample from the same list with the schedule seed. A node that wants to serve "probe paths" well must serve the customer's assets well, which is the point.
 
-**Proof of fetch**: every response carries `X-Dedan-Node: <label>.<minute>.<hmac>`, the HMAC binding the client's /24. After each hour a signer key of the node calls `revealKey(label, hour, k)` on the registry; anyone verifies the token in every "up" result and every attestation against the /24 the auditor reported. An "up" without a valid token is invalid and unpaid. A "down" needs no token. A node that does not reveal a key has no verifiable uptime for that hour, which only hurts itself.
+**Proof of fetch**: every response carries `X-Dedan-Node: <label>.<minute>.<net>.<hmac>`, the HMAC binding the client's /24 as the node saw it, which the token also carries (so an auditor behind NAT reports the network the node saw). After each hour a signer key of the node calls `revealKey(label, hour, k)` on the registry: once per hour, never before the hour ends (a governance flag allows early reveals on the devnet, whose periods are two minutes). Anyone verifies the token in every "up" result and every attestation against the network inside it, at the time of the result or the block: a token minted more than ten minutes earlier backs nothing, and a token repeated by the same auditor counts once. An "up" without a valid token is invalid, unpaid and evidence. A "down" needs no token. A node that does not reveal a key has no verifiable uptime for that hour, which only hurts itself: its results are unverifiable, never the auditor's forgery.
 
 | Probe | How | Measures | Feeds |
 |---|---|---|---|
-| Attestation | From wherever the auditor is: snap the device location to an H3 cell (resolution 5, about 17 km), connect to a node three times and fetch one small sampled asset, keep the minimum TCP round trip and the cache-hit TTFB, submit with the fetch token | Round trip from a place to a node | The latency map (§6): steering and assignment; auditor pay |
+| Attestation | From wherever the auditor is: snap the device location to an H3 cell (resolution 2, about 300 km), connect to each member of the cell three times and fetch one small sampled asset, keep the minimum TCP round trip and the cache-hit TTFB, submit with the fetch token | Round trip from a place to a node | The latency map (§6): steering and assignment; auditor pay |
 | Landing | Resolve the customer hostname through the auditor's normal recursive resolver, fetch a sampled asset, read the node id from the token | Availability as users see it, TTFB, which node users reach | Customer availability SLA; replication count; resolver conformance (unattributed) |
 | Targeted | Connect to an assigned slot member's IP with the customer SNI, fetch a sampled asset; repeat the same asset within 10 s to get a cache hit | Success or failure class, TTFB, cache-hit TTFB, TCP RTT, decoded sha256 | Node uptime; integrity; per-stream throughput; anchor rows for the latency map |
 | Integrity | Compare the decoded body hash from targeted probes with the published origin digests (current or previous) and with what other slot members served | Correct bytes served | `integrity` in quality; evidence for slashing |
@@ -302,7 +306,7 @@ Auditors are the only source of the location and quality numbers that money depe
 
 ### Results
 
-Each result is `(period, auditor id, probe type, node id from token, account, asset, metrics, failure class, token, timestamp)`; each attestation is `(cell, node label hash, rtt, hit TTFB, token, client /24)` with the attester and the block time added by the chain. Results are signed by the auditor key and shipped to the aggregator every 5 min, which returns a signed receipt per batch; attestations go to `DedanRegistry.attest` in batches and need no receipt.
+Each result is `(period, auditor id, probe type, node id from token, account, asset, metrics, failure class, token, timestamp)`; each attestation is `(cell, node label hash, rtt, hit TTFB, token, client /24)` with the attester and the block time added by the chain. Results are signed by the auditor key and shipped to the aggregator every 5 min, which returns a signed receipt per batch; attestations go to `DedanCells.attest` in batches and need no receipt.
 
 - **Failure attribution.** Connect, TLS and wrong-bytes failures always count against the node. Timeouts and 5xx count against the node only if another slot member served the same asset successfully in the same 10 min window; if every member failed, it is the origin's problem: no uptime penalty and no customer credit.
 - **Outliers.** Continuous metrics use the median across auditors. An auditor whose failure rate for a target exceeds the other auditors' by a wide margin over a day is suspended for review and unpaid for that day; auditors are never slashed automatically. Slashing is a governance action on published evidence.
@@ -332,9 +336,9 @@ mult(a)   = min over dimensions of max(0.5, 1 − 0.5 s_dim)       s = fraction 
 bill(a)   = list(a) × mult(a)
 ```
 
-`s_availability = (target − measured) / (1 − target)`, applied only when the 95% Wilson upper bound of the measured availability is below the target, so a shortfall must be statistically significant before it costs anything; `s_nodes = 1 − delivered / S`, where delivered counts members with uptime above 0.5; `s_throughput = 1 − median / floor`. Credits are automatic and come entirely out of the node pool for that account, never out of the auditor or resolver pools, so auditors have no stake in the outcome.
+`s_availability = (target − measured) / (1 − target)`, applied only when the 95% Wilson upper bound of the measured availability is below the target, so a shortfall must be statistically significant before it costs anything; `s_nodes = 1 − delivered / S`, where delivered counts members with uptime above 0.5 and no confirmed integrity mismatch (a member serving wrong bytes did not deliver the account); `s_throughput = 1 − median / floor`. Credits are automatic and come entirely out of the node pool for that account, never out of the auditor or resolver pools, so auditors have no stake in the outcome.
 
-Bills are deducted from the prepaid balance daily through the cumulative bill root (below). Resolvers compute effective balance off-chain (on-chain balance minus unapplied bills from published inputs minus any pending withdrawal) and suspend an account's domains when it cannot cover four days at list price, so nobody is served on money that is on its way out.
+Bills are deducted from the prepaid balance daily through the cumulative bill root (below). Resolvers compute effective balance off-chain (on-chain balance minus unapplied bills from published inputs minus any pending withdrawal) and suspend an account's domains when it cannot cover four days at list price (four periods on the devnet, whose day is two minutes), so nobody is served on money that is on its way out. The aggregator bills no account more than that effective balance, and every pool of the account shrinks in proportion, so one customer's bill is never paid from another's deposit; on chain, cumulative bills stay below deposits minus withdrawals.
 
 ### Pools
 
@@ -378,7 +382,7 @@ In v1 the settlement batch carries **evidence, not slashes**. Slashing and suspe
 
 1. Day closes. Nodes reveal their last token keys; auditors submit final batches. 1 h grace.
 2. Aggregator computes the latency map and the slot sets (recomputed from inputs, not trusted from anyone), quality, SLA multipliers, bills, payouts and evidence. It publishes all accepted inputs plus the full leaf lists to IPFS. The independent countersigner, a different organisation (a second instance run by the same operator counts only on the devnet), downloads the inputs, re-runs the same pure function, and co-signs `(period, inputs_hash, payout_root, bill_root, totals)`. `publishRoot` is called once with both signatures.
-3. Dispute window (24 h): anyone re-runs `aggregator recompute <cid>`. A mismatch is raised to the signer set and governance, which call `voidRoot` within the window; the bonds of whoever signed are slashed.
+3. Dispute window (24 h): anyone re-runs `aggregator recompute <cid>`. A mismatch is raised to the signer set and governance, which call `voidRoot` within that root's window (any root still inside its own window, not only the latest: voiding a root drops the roots published after it, which were computed on top of it); the bonds of whoever signed are slashed. The aggregator does not republish a voided period on its own: once the dispute is settled an operator republishes it, from corrected inputs if they were wrong, and no later period is accepted until then. Only signers holding the minimum bond count toward the threshold.
 4. After the window the root is final. Nodes, auditors and resolvers claim with one Merkle proof each (cumulative amounts, so one claim covers any number of days). Customer withdrawals apply the cumulative bill first and execute 72 h after the request, longer than one day of service plus publication grace plus the dispute window, so a bill for a day already served can never be dodged.
 
 Cumulative roots keep the chain cost to one transaction per day regardless of the number of accounts and payees. On World Chain that is cents; the same contracts would still be affordable on Ethereum L1.
@@ -407,7 +411,7 @@ Config = public part (everything above except secrets), versioned and signed. Or
 
 ### Customer onboarding
 
-1. Create account: generate or connect a key; label reserved; first deposit registers the account key on-chain.
+1. Create account: generate or connect a key; the control plane reserves the label and signs `(chain, contract, label, key)` as the registrar; the customer's `createAccount` with that signature registers the account key on chain, then deposits. Nobody can take a label the control plane did not sign for them.
 2. Add domain, origin and asset list; control plane checks CAA, fetches a sample of assets from the origin, publishes a signed `DomainAdded` config version.
 3. Customer sets `cdn.example.com CNAME <account>.dedan-cdn.net`, the `_acme-challenge` CNAME (or NS delegation), and ideally the CAA record pinning Dedan's ACME account.
 4. Control plane verifies the CNAME; resolvers and nodes verify it independently when they receive the config.
@@ -488,14 +492,14 @@ The slot assignment and the latency map are not messages: everyone computes them
 | Settlement (immutable; parameters governance-settable) | `accounts{id → key, balance, appliedBill, pendingWithdrawal, withdrawableAt}`, `claimed{payee}`, `roots{period → inputsHash, payoutRoot, billRoot, totals, registryBlock, priceTableVersion, publishedAt, voided}`, `totalDeposited`, `signers`, `threshold`, `priceTable{version → hash}`, `bonds{signer}`, `DISPUTE_WINDOW = 24 h`, `WITHDRAWAL_DELAY = 72 h` | `createAccount`, `deposit`, `requestWithdraw`, `cancelWithdraw`, `executeWithdraw(cumBill, proof)`, `claim(payee, cumPayout, proof)`, `publishRoot(input, sigs)` (k-of-n from the signer set, k = 2), `voidRoot`, `setSignerSet`, `setPriceTable`, `depositBond`, `slashBond`, `releaseBond` |
 
 - Merkle trees are OpenZeppelin `StandardMerkleTree`-compatible (double-hashed leaves, sorted pairs) so `MerkleProof.verify` is the on-chain verifier.
-- Solvency bounds checked on-chain at every publish: cumulative payouts ≤ cumulative bills ≤ cumulative deposits, and neither total ever decreases. A voided period is republished under the same number.
+- Solvency bounds checked on-chain at every publish: cumulative payouts ≤ cumulative bills ≤ cumulative deposits minus withdrawals, and neither total ever decreases; only bonded signers count toward the threshold. A voided period is republished under the same number, and nothing later is accepted before it; voiding a root drops the roots after it. Accounts are created only with the registrar's (control plane's) signature over the label and key; a withdrawn node leaves its cells and its records are cleared, and its label cannot be registered again for two days, until its votes have aged out.
 - Ordering guarantees: unbonding (7 d) > settlement + dispute window; withdrawal delay (72 h) > one day of service + grace + dispute window, so a bill always applies before the money leaves.
 - Human identity: `registerOperator`, `registerAttester` and `registerAuditor` call the World ID 4.0 verifier (`verify` with the caller's address as the signal and `dedan-operator`, `dedan-attester` or `dedan-auditor` as the action, hashed to the field as IDKit does); the nullifier is burned per action so one human holds one account per role. The verifier is deployed on World Chain mainnet and Sepolia, which is why the contracts live there.
 - Contracts are immutable. Governance sets parameters (signer set, threshold, price table, minimum stakes, verifier address, bonds); a new contract version is a new deployment referenced from `dedan.eth`.
 
 ### Aggregator inputs, per period
 
-`inputs_hash = sha256` of the sorted set of all accepted `ProbeResult` envelopes, the `Attested` and `KeyRevealed` events of the window (a block range on the registry), the `AssetSample` set, the registry block, the account config versions, and the price table version. The full set and the leaf lists are published to IPFS. The computation is a pure function `f(inputs) → (latency map, slot sets, quality, multipliers, payout leaves, bill leaves, evidence)`, versioned and pinned per period; `aggregator recompute <cid>` reproduces the roots, and the countersigner runs exactly that before signing.
+`inputs_hash = sha256(manifest.json)`, the manifest listing the period, the registry block and its time, the parameters, and the sha256 of every input file: the registry and cells events from genesis to the registry block, the probe batches filed in the period, the asset samples, the account-signed configs, the Settlement accounts and the tier prices at the registry block, the node records, the geo table and the previous period's state. The full set and the leaf lists are published (IPFS in production, a shared volume on the devnet). The countersigner re-reads every chain-derived input at the registry block itself (records, accounts, prices, the block's time), checks the previous state against the previous period's on-chain inputs hash by recomputing it, and takes the origin digests again before signing. The computation is a pure function `f(inputs) → (latency map, slot sets, quality, multipliers, payout leaves, bill leaves, evidence)`, versioned and pinned per period; `aggregator recompute <cid>` reproduces the roots, and the countersigner runs exactly that before signing.
 
 ## 12. Decisions and risks
 
@@ -506,7 +510,7 @@ Decisions recorded for v1:
 | 1 | TLS | Per-node keys and certificates, control-plane-run ACME under one account, `shortlived` profile, unique node SAN, PSL listing, CAA pinning recommended |
 | 2 | Chain | World Chain (the OP-stack L2 where the World ID 4.0 verifier lives); native USDC for balances and stakes; one countersigned settlement transaction per day; `dedan.eth` on Ethereum L1 points at it |
 | 3 | Aggregator | One operator plus one independent countersigner (k = 2) from day one; no automatic slashing; evidence executed by governance |
-| 4 | Location | No regions. A crowd-sourced latency map: verified humans attest round trips from H3 cells (resolution 5); resolvers steer from it and the assignment picks nodes from it; a node declares nothing about its location that touches money. The devnet seeds the map from five cities |
+| 4 | Location | No regions. A crowd-sourced latency map: verified humans attest round trips from H3 cells (resolution 2); resolvers steer from it and the assignment picks nodes from it; a node declares nothing about its location that touches money. The devnet seeds the map from five cities |
 | 5 | Periods | Audit 1 h, assignment 24 h (hourly for new accounts), settlement 24 h, dispute 24 h, withdrawal delay 72 h, unbonding 7 d |
 | 6 | Pool split | 10 / 5 / 5 auditor / resolver / protocol from list price; the rest, after SLA credits, to nodes |
 | 7 | Stack | Rust workspace (Pingora node with OpenSSL backend, hickory resolver, axum control plane, alloy chain client), Solidity + Foundry contracts, immutable with governance-settable parameters |
@@ -526,7 +530,7 @@ Known limits and risks:
 - **Non-canonical names.** Until canonical L1 `dedan.eth` points at this registry, `<label>.dedan.eth` resolves only through Dedan's own Universal Resolver. The tree mirrors ENS so the switch is a pointer, not a rename.
 - **EAC assignee limit.** Enhanced Access Control counts at most fifteen holders per role per resource; population roles therefore live on per-human resources, and a node may hand out at most fifteen signer keys.
 - **Map corruption.** Moving a cell's median needs more than half of its k humans, each with a fetch token from the node and a network within 250 km of the cell; anchors from assigned probes clamp the crowd median; disagreement is published evidence, and governance suspends attesters on it, never automatically.
-- **Location privacy.** Attestations reveal one 17 km cell per auditor per day, with timestamps bucketed to the hour in the published inputs; the app shows the cell before submitting. Auditors who do not want that run assigned probes only.
+- **Location privacy.** Attestations reveal one cell of about 300 km per auditor per day, with timestamps bucketed to the hour in the published inputs; the app shows the cell before submitting. Auditors who do not want that run assigned probes only.
 - **Density.** Cells nobody measures are invisible: a node serving an empty area earns nothing until someone attests from there, and clients there are steered by distance until the map fills in.
 - **Measurement noise.** SLA credits require statistical significance, so an account with few probes gets no credit for small shortfalls; the fix is more auditors, not a lower bar.
 - **Volatile dependency.** pingora-cache's API is declared unstable; the version is pinned and the disk storage is Dedan's own code.
@@ -580,7 +584,7 @@ Known limits and risks:
 | v3.1 | v3.2 | Why |
 |---|---|---|
 | Attestations are events; every reader validates them (token, GeoIP, caps, one cell per day) and computes medians off chain | `DedanCells` keeps the map: nodes join resolution-2 cells, `attest(cell, batch)` is one vote per human per node per cell into per-day histograms, `median()` is the cell's record; readers mirror the same rules from the events | The request: the map as ENS records, written by the crowd in batches, one batch a minute, an efficient median. A histogram with one vote per human is exact, order-independent and cheap; a streaming estimate is neither |
-| Cells at resolution 5 (17 km), ring search to 3 | Resolution 2 (about 300 km), ring search to 2; nodes join their cells explicitly | Regions a node can join by the hundred; latency inside a cell differs by a few ms |
+| Cells at resolution 5 (17 km), ring search to 3 | Resolution 2 (about 300 km), ring search to 3; nodes join their cells explicitly | Regions a node can join by the hundred; latency inside a cell differs by a few ms |
 | No cell names | `<cell>.dedan.eth` in `DedanRegistry` with the registry as its own subregistry: `<label>.<cell>.dedan.eth` is the node inside the cell, same token, records keyed by the full namehash | The user's "dedan → cell → node" tree without a contract per cell or a token per membership |
 | GeoIP, per-node caps and one cell per day as validity rules | On chain: membership, one batch per minute per cell, one vote per node per cell; off chain: token and GeoIP for pay and evidence only; a human may attest from any cell | The contract cannot geolocate; one vote per human bounds what a liar can do; evidence goes to governance |
 
@@ -595,11 +599,11 @@ Known limits and risks:
 | Node heartbeats another node's or a victim's IP | Endpoint challenge signed by the node key; one endpoint per node; nodes identified by token, not IP |
 | Every node certificate counts against one registered domain; identical SAN sets hit the duplicate limit | Unique node SAN, PSL listing of `dedan-cdn.net`, ARI renewals, sticky assignment, rate-limit override requested |
 | Rogue resolver operator serves its own TXT and retries until validation lands on it | CAA `accounturi` pinning to Dedan's ACME account; five operators; resolvers serve only control-plane-signed TXT records |
-| Single aggregator pays itself, slashes rivals, withholds inputs | k = 2 countersigning after independent recomputation; no slashes in batches; bonds sized to a day of bills; unretrievable inputs void the root |
+| Single aggregator pays itself, slashes rivals, withholds inputs | k = 2 countersigning after independent recomputation: the countersigner re-reads payees, accounts, prices and the clock at the registry block, recomputes the previous period from its on-chain inputs hash, and re-takes the origin digests; no slashes in batches; bonds sized to a day of bills and required to sign; unretrievable inputs void the root |
 | Customer sabotages its own probe assets to halve its bill | Asset validation at onboarding and hourly; all-members-fail is attributed to the origin and earns no credit |
 | Customer withdraws before the day's bill lands | 72 h withdrawal delay; bill applied first; resolvers pause service when balance minus pending withdrawal cannot cover four days |
-| Aggregator declares bills larger than customers ever deposited and pays them out | On-chain bound: cumulative bills ≤ cumulative deposits, payouts ≤ bills |
-| Attester spoofs its cell or its round trips | One vote per human per node per cell, medians over k humans, so a lie moves nothing alone; the fetch token binds the /24 the node saw, which must geolocate within 250 km of the cell, or the attestation is unpaid and evidence to governance (suspension revokes the human's role) |
+| Aggregator declares bills larger than customers ever deposited and pays them out | Per account, no bill exceeds the effective balance at the registry block (recomputed by the countersigner); on chain, cumulative bills ≤ deposits minus withdrawals and payouts ≤ bills |
+| Attester spoofs its cell or its round trips | One vote per human per node per cell, and a node ranks in a cell only with k votes of its own, so a lie moves nothing alone; the fetch token binds the /24 the node saw, which must geolocate within 250 km of the cell, or the attestation is unpaid and evidence to governance (suspension revokes the human's role) |
 | Operator mints many node names or attester accounts from one box | Each human role needs a World ID proof with a burned nullifier; each name needs its own stake and its own /24 to sit in a slot set; a name removed cannot resurrect old roles (EAC version bump) |
 | Node operator recruits humans to attest fake low round trips from many cells | Each cell needs more than half of its k humans, one vote each; their tokens and networks are checked off chain and the humans are evidence; a set is won by coverage and a slot pays the same everywhere, so the prize is bounded |
 | One human posts every minute to drag a cell's median | Its newest sample is its only vote for that node in that cell; a thousand batches change nothing after the first |

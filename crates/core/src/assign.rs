@@ -95,28 +95,29 @@ pub fn assign(
     let mut order: Vec<&AccountInfo> = accounts.iter().collect();
     order.sort_by_key(|a| keccak256([seed.as_slice(), a.id.0.as_bytes()].concat()));
 
-    // kept members register their capacity first, so stickiness never depends on the seeded order
+    // kept members register their capacity first, so stickiness never depends on the seeded order; they pass
+    // the same network and admission checks as new members, so yesterday cannot carry two nodes of one /24
+    // or a node past its admission cap into today
     let mut kept: BTreeMap<AccountId, Vec<NodeId>> = BTreeMap::new();
     if let Some(y) = yesterday {
         for a in &order {
             let Some(prev) = y.assignment.sets.get(&a.id) else {
                 continue;
             };
-            let keep: Vec<NodeId> = prev
-                .iter()
-                .filter(|n| by_id.get(n).is_some_and(|info| eligible(info, a, map)))
-                .filter(|n| {
-                    y.quality
-                        .get(&(a.id.clone(), (*n).clone()))
-                        .copied()
-                        .unwrap_or(0.0)
-                        >= p.sticky_quality
-                })
-                .take(a.nodes as usize)
-                .cloned()
-                .collect();
-            for n in &keep {
-                *committed.entry(n.clone()).or_default() += a.class.mbps();
+            let mut keep: Vec<NodeId> = Vec::new();
+            for n in prev {
+                if keep.len() >= a.nodes as usize {
+                    break;
+                }
+                let Some(info) = by_id.get(n) else { continue };
+                let quality = y.quality.get(&(a.id.clone(), n.clone())).copied().unwrap_or(0.0);
+                let same_net = keep.iter().any(|m| prefix(by_id[m].ip) == prefix(info.ip));
+                let room = committed.get(n).copied().unwrap_or(0) + a.class.mbps()
+                    <= p.admission_k * info.class.mbps();
+                if eligible(info, a, map) && quality >= p.sticky_quality && !same_net && room {
+                    *committed.entry(n.clone()).or_default() += a.class.mbps();
+                    keep.push(n.clone());
+                }
             }
             kept.insert(a.id.clone(), keep);
         }
@@ -252,6 +253,7 @@ mod tests {
             hit_ttfb_ms: None,
             ts: TS,
             anchor: false,
+            token: String::new(),
         }
     }
 
@@ -439,6 +441,52 @@ mod tests {
             &strict,
         );
         assert_eq!(today.sets[&acc.id], vec![nid("fra"), nid("ist")]);
+    }
+
+    /// Yesterday's members pass today's checks: two of one /24 are not both kept, nor a node past its cap.
+    #[test]
+    fn kept_members_pass_the_network_and_admission_checks() {
+        let map = city_map();
+        let nodes = vec![
+            node("ist", "10.77.16.1", Class::M100, None),
+            node("fra", "10.77.32.1", Class::M100, None),
+            node("tok", "10.77.32.9", Class::M100, None), // the same /24 as fra
+        ];
+        let acc = account("acme", 2, Class::M100);
+        let prev = Assignment {
+            seed: B256::ZERO,
+            sets: BTreeMap::from([(acc.id.clone(), vec![nid("fra"), nid("tok")])]),
+        };
+        let quality: HashMap<(AccountId, NodeId), f64> = HashMap::from([
+            ((acc.id.clone(), nid("fra")), 1.0),
+            ((acc.id.clone(), nid("tok")), 1.0),
+        ]);
+        let y = Yesterday {
+            assignment: &prev,
+            quality: &quality,
+        };
+        let a = assign(B256::ZERO, &nodes, std::slice::from_ref(&acc), &map, Some(&y), &AssignParams::default());
+        let set = &a.sets[&acc.id];
+        assert_eq!(set.len(), 2);
+        assert!(
+            !(set.contains(&nid("fra")) && set.contains(&nid("tok"))),
+            "tok shares fra's network: never both, kept or not ({set:?})"
+        );
+        // four 100M accounts kept `fra` yesterday; a 100M node takes at most three
+        let accounts: Vec<AccountInfo> = (0..4).map(|i| account(&format!("a{i}"), 1, Class::M100)).collect();
+        let prev = Assignment {
+            seed: B256::ZERO,
+            sets: accounts.iter().map(|a| (a.id.clone(), vec![nid("fra")])).collect(),
+        };
+        let quality: HashMap<(AccountId, NodeId), f64> =
+            accounts.iter().map(|a| ((a.id.clone(), nid("fra")), 1.0)).collect();
+        let y = Yesterday {
+            assignment: &prev,
+            quality: &quality,
+        };
+        let a = assign(B256::ZERO, &nodes, &accounts, &map, Some(&y), &AssignParams::default());
+        let holding_fra = a.sets.values().filter(|s| s.contains(&nid("fra"))).count();
+        assert_eq!(holding_fra, 3);
     }
 
     fn arb_node(id: u64) -> impl Strategy<Value = NodeInfo> {

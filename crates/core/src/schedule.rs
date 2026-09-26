@@ -2,7 +2,7 @@
 //! probes when, all derived from a seed, so anyone can recompute who was supposed to probe what.
 
 use crate::types::*;
-use alloy::primitives::{keccak256, B256};
+use alloy::primitives::{keccak256, Address, B256};
 
 /// The day's seed, the one the assignment uses too. ponytail: the first L1 block at or after the period
 /// start once periods are hourly; a hash of the day is enough while the map moves daily.
@@ -20,19 +20,40 @@ fn draw(seed: B256, parts: &[&[u8]]) -> u64 {
     u64::from_be_bytes(h[..8].try_into().expect("8 bytes"))
 }
 
-/// The `n` assets of an account's manifest sampled for the day, without repeats, in draw order.
+/// The `n` assets of an account's manifest sampled for the day, without repeats, in draw order. The manifest
+/// is the customer's own file: repeated lines count once, or a list with fewer distinct paths than `n` would
+/// keep every auditor and the period close drawing forever.
 pub fn sample_assets(seed: B256, account: &AccountId, manifest: &[String], n: usize) -> Vec<String> {
+    let mut unique: Vec<&String> = Vec::new();
+    for m in manifest {
+        if !unique.contains(&m) {
+            unique.push(m);
+        }
+    }
     let mut out: Vec<String> = Vec::new();
     let mut k = 0u64;
-    while out.len() < n.min(manifest.len()) {
+    while out.len() < n.min(unique.len()) {
         let i = draw(seed, &[account.0.as_bytes(), b"asset", &k.to_be_bytes()]) as usize
-            % manifest.len();
-        if !out.contains(&manifest[i]) {
-            out.push(manifest[i].clone());
+            % unique.len();
+        if !out.contains(unique[i]) {
+            out.push(unique[i].clone());
         }
         k += 1;
     }
     out
+}
+
+/// The auditors assigned to an account for the day (§7): every candidate ranked by
+/// `hash(seed ‖ account ‖ auditor)`, the first `n` kept, so anyone can recompute who was supposed to probe
+/// what and no auditor picks its own targets. `candidates` are the accounts that may probe (role and stake).
+pub fn auditors_for(seed: B256, account: &AccountId, candidates: &[Address], n: usize) -> Vec<Address> {
+    let mut ranked: Vec<(u64, Address)> = candidates
+        .iter()
+        .map(|a| (draw(seed, &[account.0.as_bytes(), b"auditor", a.as_slice()]), *a))
+        .collect();
+    ranked.sort();
+    ranked.dedup_by_key(|(_, a)| *a);
+    ranked.into_iter().take(n).map(|(_, a)| a).collect()
 }
 
 /// One scheduled probe: the asset, the slot member aimed at (`None` = a landing probe through the
@@ -130,5 +151,31 @@ mod tests {
         fn as_deref_label(&self) -> Option<&str> {
             self.as_ref().map(|n| n.0.as_str())
         }
+    }
+
+    #[test]
+    fn repeated_manifest_lines_count_once() {
+        let seed = B256::from([3u8; 32]);
+        let acme = AccountId::new("acme");
+        let twice = vec!["/a".to_string(), "/a".to_string()];
+        assert_eq!(sample_assets(seed, &acme, &twice, 4), vec!["/a".to_string()]);
+        let m: Vec<String> = ["/a", "/b", "/b", "/b"].iter().map(|x| x.to_string()).collect();
+        let mut got = sample_assets(seed, &acme, &m, 4);
+        got.sort();
+        assert_eq!(got, vec!["/a".to_string(), "/b".to_string()]);
+    }
+
+    #[test]
+    fn auditors_are_chosen_by_the_seed() {
+        let seed = B256::from([5u8; 32]);
+        let acme = AccountId::new("acme");
+        let all: Vec<Address> = (1..=8u8).map(|i| Address::from([i; 20])).collect();
+        let five = auditors_for(seed, &acme, &all, 5);
+        assert_eq!(five.len(), 5);
+        let mut shuffled = all.clone();
+        shuffled.reverse();
+        assert_eq!(auditors_for(seed, &acme, &shuffled, 5), five, "order of candidates does not matter");
+        assert_ne!(auditors_for(B256::from([6u8; 32]), &acme, &all, 5), five, "another day, another draw");
+        assert_eq!(auditors_for(seed, &acme, &all[..3], 5).len(), 3, "fewer candidates than the target: all");
     }
 }

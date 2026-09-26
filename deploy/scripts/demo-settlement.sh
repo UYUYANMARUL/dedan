@@ -4,7 +4,7 @@
 #   1. the customer funds its account; the settlement profile starts: the five city humans run the auditor app
 #      (staking as auditors on the way), plus the aggregator and the countersigner
 #   2. sabotage: Seoul serves from a tampered origin, Tokyo is stopped, a human on an Istanbul network attests
-#      Seoul's cell from 9,000 km away, an auditor in New York reports probes it never made
+#      Seoul's cell from 7,900 km away, an auditor in New York reports probes it never made
 #   3. the first full period after that closes: inputs published, roots recomputed by the countersigner,
 #      published with two signatures
 #   4. the report; `recompute` reproduces the roots from the published inputs
@@ -31,11 +31,11 @@ last=$(cast call "$S" "\"lastPeriod()(uint64)\"" $rpc | tr -d '\r\n')
 [ "$last" = "0" ] || { echo "the chain already holds settlement period $last (make smoke publishes one): run make devnet-reset first"; exit 1; }
 $COMPOSE up -d --build --wait resolver >/dev/null
 
-echo "== the customer funds acme with 10,000 USDC (Settlement.createAccount, deposit)"
-key=$(cast call "$S" "\"accounts(bytes32)(address,uint256,uint256,uint256,uint64)\"" "$ACME" $rpc | head -1 | tr -d '\r\n')
-[ "$key" != "0x0000000000000000000000000000000000000000" ] || cast send "$S" "\"createAccount(bytes32,address)\"" "$ACME" "$(address_of 1)" --private-key "$(private_key 1)" $rpc >/dev/null
-cast send "$USDC" "\"approve(address,uint256)\"" "$S" 10000000000 --private-key "$(private_key 1)" $rpc >/dev/null
-cast send "$S" "\"deposit(bytes32,uint256)\"" "$ACME" 10000000000 --private-key "$(private_key 1)" $rpc >/dev/null
+echo "== the customer's account: acme, registered with the control plane's signature and funded at deploy"
+acct=$(cast call "$S" "\"accounts(bytes32)(address,uint256,uint256,uint256,uint64)\"" "$ACME" $rpc | tr -d '\r')
+key=$(echo "$acct" | sed -n 1p); bal=$(echo "$acct" | sed -n 2p | cut -d' ' -f1)
+[ "$key" = "$(address_of 1)" ] || { echo "FAIL: acme is not registered to the customer key (got $key): run make devnet-reset"; exit 1; }
+echo "acme: account key $key, balance $(python3 -c "print($bal/1e6)") USDC; its config is signed by that key and relayed by the control plane"
 
 echo "== the settlement loop: five city humans start the auditor app (World ID proof + 100 USDC stake = ROLE_AUDITOR), the aggregator, the countersigner"
 $COMPOSE --profile settlement --profile sabotage up -d --wait origin-tampered countersigner aggregator auditor-frankfurt auditor-tokyo auditor-seoul auditor-newyork auditor-istanbul
@@ -54,7 +54,7 @@ docker restart dedan-devnet-seoul-1 >/dev/null
 node seoul sh -c "echo '10.77.64.21 origin' >> /etc/hosts"
 echo "-- tokyo is stopped"
 docker stop dedan-devnet-tokyo-1 >/dev/null
-echo "-- a human on an Istanbul network attests Seoul's cell from 9,000 km away (auditor-spoof, key 25)"
+echo "-- a human on an Istanbul network attests Seoul's cell from 7,900 km away (auditor-spoof, key 25)"
 echo "-- an auditor in New York reports probes it never made, with made-up tokens (auditor-liar, key 26)"
 $COMPOSE --profile settlement --profile sabotage up -d auditor-spoof auditor-liar
 since=$(date +%s)

@@ -66,7 +66,7 @@ x-node-env: &node-env
   DEDAN_CP_URL: http://cp:8070
   DEDAN_ZONE: dedan-cdn.test
   DEDAN_REVEAL_IMMEDIATELY: "1" # devnet: tokens verify at once instead of after the hour
-  DEDAN_DEFAULT_TTL_SECS: "60" # short, so `make e2e` can show stale-if-error within a minute
+  DEDAN_DEFAULT_TTL_SECS: "60" # only for a config whose cache rules give no TTL (acme's give 60 s, so `make e2e` shows stale objects within a minute)
   RUST_LOG: info
 
 x-user: &user
@@ -85,7 +85,9 @@ x-chain-env: &chain-env
   DEDAN_MNEMONIC: "test test test test test test test test test test test junk"
   DEDAN_PERIOD_SECS: "120" # a settlement day compressed into two minutes; the same code settles daily in production
   DEDAN_SAMPLE_N: "4"
-  DEDAN_MAP_K: "1"
+  DEDAN_MAP_K: "1" # one human per city on the devnet; the code's default is the documented 3
+  DEDAN_CP_URL: http://cp:8070 # the account-signed configs the control plane relays
+  DEDAN_AUDITORS_PER_ACCOUNT: "10" # every staked auditor of the devnet probes acme; the default is 5 per account
   RUST_LOG: info
 
 x-chain-volumes: &chain-volumes
@@ -159,6 +161,8 @@ services:
       DEDAN_HOSTS: /wan/hosts.txt:/devnet/dynamic-hosts.txt # the second one lists cities added while running
       DEDAN_ZONES_DIR: /zones
       DEDAN_MAP_K: "1"
+      DEDAN_PERIOD_SECS: "120" # prices a period for the balance check: an account needs 4 periods of list price
+      DEDAN_AGGREGATOR_URL: http://aggregator:8060 # the published period the sets are sticky on (settlement profile)
       RUST_LOG: info
     volumes:
       - ../contracts/deployments:/deployments:ro
@@ -182,8 +186,9 @@ services:
       anvil:
         condition: service_healthy
 
-  # the control plane (crates/cp): signed account configs and purges over an event stream, ACME orders at Pebble
-  # with DNS-01 through the nameserver's TXT API, certificates back to the nodes
+  # the control plane (crates/cp): relays the configs and purges customers sign with their account keys over a
+  # replayable event stream, ACME orders at Pebble (`shortlived` profile, ARI renewals) with DNS-01 through the
+  # nameserver's TXT API, certificates back to the nodes; `dedan-cp config|purge` is the customer's CLI
   cp:
     image: dedan-services:local
     command: ["dedan-cp"]
@@ -202,8 +207,9 @@ services:
       - ../contracts/deployments:/deployments:ro
       - ./devnet:/devnet:ro
       - pebble-certs:/pebble-certs:ro
+      - cp-data:/data # the accepted configs and the event seq, kept across restarts
     ports:
-      - "8070:8070" # /health, /v1/configs, /v1/stream, POST /v1/purge, POST /v1/certs
+      - "8070:8070" # /health, /v1/configs (GET, POST), /v1/stream, POST /v1/purge, POST /v1/certs
     healthcheck:
       test: ["CMD", "curl", "-sf", "http://127.0.0.1:8070/health"]
       interval: 2s
@@ -556,6 +562,7 @@ networks:
 
 volumes:
   pebble-certs:
+  cp-data:
   lego-data:
   settlement-data:
   foundry-home:

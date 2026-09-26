@@ -95,6 +95,8 @@ pub struct EnsClient<P> {
     provider: P,
     universal_resolver: Address,
     parent: String,
+    /// Read at this block instead of the head: how the countersigner checks the records a period used.
+    block: Option<u64>,
 }
 
 impl<P: Provider + Clone> EnsClient<P> {
@@ -103,6 +105,17 @@ impl<P: Provider + Clone> EnsClient<P> {
             provider,
             universal_resolver,
             parent: parent.into(),
+            block: None,
+        }
+    }
+
+    /// The same client reading every record as of `block`.
+    pub fn at_block(&self, block: u64) -> Self {
+        Self {
+            provider: self.provider.clone(),
+            universal_resolver: self.universal_resolver,
+            parent: self.parent.clone(),
+            block: Some(block),
         }
     }
 
@@ -113,14 +126,18 @@ impl<P: Provider + Clone> EnsClient<P> {
     /// `resolve(name, data)` per ENSIP-10: the Universal Resolver finds the name's resolver and calls it.
     async fn resolve(&self, name: &[u8], data: Vec<u8>) -> Result<Option<Bytes>, EnsError> {
         let ur = IUniversalResolver::new(self.universal_resolver, self.provider.clone());
-        match ur
-            .resolve(Bytes::copy_from_slice(name), Bytes::from(data))
-            .call()
-            .await
-        {
+        let mut call = ur.resolve(Bytes::copy_from_slice(name), Bytes::from(data));
+        if let Some(b) = self.block {
+            call = call.block(b.into());
+        }
+        match call.call().await {
             Ok(r) => Ok(Some(r.result)),
             // an unset record answers with empty data on some paths and reverts on others; both mean "none"
-            Err(_) => Ok(None),
+            Err(alloy::contract::Error::TransportError(e)) if e.is_error_resp() => Ok(None),
+            Err(alloy::contract::Error::ZeroData(..)) => Ok(None),
+            // an unreachable RPC is no answer at all: reading it as "no record" would drop a node's endpoint or
+            // class from a period's inputs and change pay, so the caller retries instead
+            Err(e) => Err(e.into()),
         }
     }
 
@@ -131,7 +148,9 @@ impl<P: Provider + Clone> EnsClient<P> {
         }
         .abi_encode();
         match self.resolve(name, data).await? {
-            Some(raw) if !raw.is_empty() => Ok(String::abi_decode(&raw)?),
+            // a record that does not decode comes from the node's own resolver: read it as missing, so one
+            // operator cannot stop every reader by pointing its name at a resolver that answers garbage
+            Some(raw) if !raw.is_empty() => Ok(String::abi_decode(&raw).unwrap_or_default()),
             _ => Ok(String::new()),
         }
     }
@@ -149,7 +168,9 @@ impl<P: Provider + Clone> EnsClient<P> {
         }
         .abi_encode();
         match self.resolve(name, data).await? {
-            Some(raw) if !raw.is_empty() => Ok(Bytes::abi_decode(&raw)?.to_vec()),
+            Some(raw) if !raw.is_empty() => Ok(Bytes::abi_decode(&raw)
+                .map(|b| b.to_vec())
+                .unwrap_or_default()),
             _ => Ok(Vec::new()),
         }
     }
@@ -162,7 +183,7 @@ impl<P: Provider + Clone> EnsClient<P> {
             .resolve(&name, IAddrResolver::addrCall { node }.abi_encode())
             .await?
         {
-            Some(raw) if !raw.is_empty() => Address::abi_decode(&raw)?,
+            Some(raw) if !raw.is_empty() => Address::abi_decode(&raw).unwrap_or(Address::ZERO),
             _ => Address::ZERO,
         };
         let a = self.dns_record(&name, node, RR_A).await?;

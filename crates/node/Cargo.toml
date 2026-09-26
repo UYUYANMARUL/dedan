@@ -9,7 +9,6 @@ repository.workspace = true
 [dependencies]
 dedan-core = { path = "../core" }
 pingora = { version = "0.9", features = ["proxy", "cache", "rustls"] }
-rand = "0.9"
 rcgen = "0.14"
 rustls = { version = "0.23", default-features = false, features = ["ring", "std"] }
 rustls-pemfile = "2"

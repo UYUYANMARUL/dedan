@@ -17,6 +17,7 @@ pub mod map;
 pub mod merkle;
 pub mod schedule;
 pub mod score;
+pub mod settlement;
 pub mod token;
 pub mod types;
 

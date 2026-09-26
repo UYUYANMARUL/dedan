@@ -1,6 +1,7 @@
 //! Certificates (ARCHITECTURE.md §10): the node makes a key and a CSR per SAN set, the control plane runs the
 //! ACME order, the chain comes back and is served for its names from an in-memory store the TLS listener
-//! consults per SNI; renewal at two thirds of the lifetime. Private keys never leave the node.
+//! consults per SNI; renewal at two thirds of the lifetime, naming the certificate it renews (ARI `replaces`).
+//! Private keys never leave the node.
 
 use std::collections::HashMap;
 use std::fmt;
@@ -19,6 +20,8 @@ struct Held {
     key: Arc<CertifiedKey>,
     not_before: u64,
     not_after: u64,
+    /// The certificate's ARI identifier (`CertIssued.ari_id`), sent back as `replaces` when it is renewed.
+    ari_id: Option<String>,
 }
 
 /// What the listener serves: one certified key per hostname, swapped without a restart.
@@ -47,8 +50,13 @@ impl CertStore {
         self.by_name.read().expect("certs").keys().cloned().collect()
     }
 
+    /// The ARI identifier of the certificate held for `name`.
+    pub fn ari_id(&self, name: &str) -> Option<String> {
+        self.by_name.read().expect("certs").get(&name.to_lowercase())?.ari_id.clone()
+    }
+
     /// Loads a PEM chain with its PKCS#8 key for every SAN it covers.
-    pub fn load(&self, sans: &[String], chain_pem: &str, key_der: &[u8]) -> Result<(), Error> {
+    pub fn load(&self, sans: &[String], chain_pem: &str, key_der: &[u8], ari_id: Option<String>) -> Result<(), Error> {
         let certs: Vec<CertificateDer<'static>> = rustls_pemfile::certs(&mut chain_pem.as_bytes())
             .collect::<Result<_, _>>()?;
         let leaf = certs.first().ok_or("empty certificate chain")?;
@@ -61,6 +69,7 @@ impl CertStore {
             key: Arc::new(CertifiedKey::new(certs, signing)),
             not_before,
             not_after,
+            ari_id,
         };
         let mut map = self.by_name.write().expect("certs");
         for s in sans {

@@ -86,6 +86,9 @@ pub struct ValidAttestation {
     pub hit_ttfb_ms: Option<u32>,
     pub ts: u64,
     pub anchor: bool,
+    /// The fetch token behind it: pay counts one attestation per token and human.
+    #[serde(default)]
+    pub token: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -94,6 +97,8 @@ pub enum Rejection {
     UnknownNode,
     WrongEpoch,
     BadToken,
+    /// The node never revealed the key for the token's hour: nothing to hold against the attester.
+    Unverifiable,
     UnknownLocation,
     OutOfArea { km: f64 },
 }
@@ -110,9 +115,31 @@ pub struct Evidence {
     pub reason: Rejection,
 }
 
-/// Verifies a fetch token for a node against the key that node revealed.
+/// A token minted more than this many minutes before the result (or the attestation's block) is stale.
+pub const TOKEN_MAX_AGE_MIN: u64 = 10;
+/// Clock skew allowed the other way: a token from slightly after the reported time.
+pub const TOKEN_MAX_AHEAD_MIN: u64 = 2;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum TokenStatus {
+    Valid,
+    /// Wrong node, wrong time, malformed, or a MAC that the revealed key does not produce.
+    Invalid,
+    /// The node revealed no key for the token's hour: the node's loss, not the auditor's fault.
+    NoKey,
+}
+
+/// Verifies a fetch token for a node against the key that node revealed, at the time it was reported.
 pub trait TokenCheck {
-    fn check(&self, token: &str, node: &NodeId, prefix: &str) -> bool;
+    /// `token` names `node`, was minted within [`TOKEN_MAX_AGE_MIN`] minutes before `at` (the result's or the
+    /// block's time) and its MAC verifies against the key `node` revealed for that hour.
+    fn check(&self, token: &str, node: &NodeId, at: u64) -> TokenStatus;
+}
+
+/// The network inside a token (`10.77.16.0/24`), what the location check places; empty when malformed.
+pub fn token_prefix(token: &str) -> String {
+    token.parse::<Token>().map(|t| t.prefix).unwrap_or_default()
 }
 
 /// Locates a client prefix (`10.77.0.0/24`): GeoIP in production, a table on the devnet.
@@ -133,9 +160,12 @@ pub struct RevealSet {
 }
 
 impl RevealSet {
+    /// The first reveal of an hour counts; the contract refuses a second one, and a mirror that took the last
+    /// would let a node re-key an hour and turn honest auditors' tokens into forgeries.
     pub fn add(&mut self, reveal: &KeyReveal) {
         self.keys
-            .insert((reveal.node_id.clone(), reveal.hour), reveal.k_hour);
+            .entry((reveal.node_id.clone(), reveal.hour))
+            .or_insert(reveal.k_hour);
     }
 
     pub fn len(&self) -> usize {
@@ -148,23 +178,34 @@ impl RevealSet {
 }
 
 impl TokenCheck for RevealSet {
-    fn check(&self, token: &str, node: &NodeId, prefix: &str) -> bool {
+    fn check(&self, token: &str, node: &NodeId, at: u64) -> TokenStatus {
         let Ok(t) = token.parse::<Token>() else {
-            return false;
+            return TokenStatus::Invalid;
         };
+        let now_min = token::minute_of(at);
+        if &t.node_id != node
+            || t.minute + TOKEN_MAX_AGE_MIN < now_min
+            || t.minute > now_min + TOKEN_MAX_AHEAD_MIN
+        {
+            return TokenStatus::Invalid;
+        }
         let hour = t.minute / 60;
         let Some(k) = self.keys.get(&(node.clone(), hour)) else {
-            return false;
+            return TokenStatus::NoKey;
         };
-        token::verify(
+        let ok = token::verify(
             &t,
             &KeyReveal {
                 node_id: node.clone(),
                 hour,
                 k_hour: *k,
             },
-            prefix,
-        )
+        );
+        if ok {
+            TokenStatus::Valid
+        } else {
+            TokenStatus::Invalid
+        }
     }
 }
 
@@ -199,10 +240,14 @@ impl<'a> Validator<'a> {
             ts: a.ts,
             reason,
         };
-        if !self.tokens.check(&a.token, &a.node_id, &a.prefix) {
-            return Err(reject(Rejection::BadToken));
+        match self.tokens.check(&a.token, &a.node_id, a.ts) {
+            TokenStatus::Valid => {}
+            TokenStatus::Invalid => return Err(reject(Rejection::BadToken)),
+            TokenStatus::NoKey => return Err(reject(Rejection::Unverifiable)),
         }
-        let (Some(here), Some(centre)) = (self.geo.locate(&a.prefix), geo::centroid(a.cell)) else {
+        // where the node saw the client, from inside the token: the attester's own report could be its LAN
+        let net = token_prefix(&a.token);
+        let (Some(here), Some(centre)) = (self.geo.locate(&net), geo::centroid(a.cell)) else {
             return Err(reject(Rejection::UnknownLocation));
         };
         let km = geo::distance_km(here, centre);
@@ -217,6 +262,7 @@ impl<'a> Validator<'a> {
             hit_ttfb_ms: a.hit_ttfb_ms,
             ts: a.ts,
             anchor: a.anchor,
+            token: a.token.clone(),
         })
     }
 
@@ -378,7 +424,7 @@ impl Map {
     /// chain's clock (the head block's time), so the window is the contract's.
     pub fn from_votes(
         events: &[AttestedEvent],
-        _members: &Membership,
+        members: &Membership,
         labels: &HashMap<B256, NodeId>,
         now: u64,
         params: &MapParams,
@@ -406,9 +452,12 @@ impl Map {
                 .or_insert_with(|| vec![0; nb])[bucket] += 1;
             votes.insert(key, (epoch, bucket, e.rtt_ms, e.ts));
         }
+        // like the contract's `snapshot`: only the cell's current members rank there, so a node that left keeps
+        // no rank for the two days its votes would otherwise linger
+        let member = |cell: &Cell, node: &NodeId| members.get(cell).is_some_and(|m| m.contains(node));
         let mut voters: BTreeMap<Cell, BTreeMap<NodeId, Vec<Voter>>> = BTreeMap::new();
         for ((attester, cell, node), (epoch, _, rtt_ms, ts)) in &votes {
-            if *epoch + 1 < today || *epoch > today {
+            if *epoch + 1 < today || *epoch > today || !member(cell, node) {
                 continue;
             }
             voters
@@ -430,7 +479,7 @@ impl Map {
         // the window: today and yesterday, merged per cell and node; nodes without a vote left drop out
         let mut window: BTreeMap<Cell, BTreeMap<NodeId, Vec<u32>>> = BTreeMap::new();
         for ((cell, node, epoch), h) in &hist {
-            if *epoch + 1 < today || *epoch > today {
+            if *epoch + 1 < today || *epoch > today || !member(cell, node) {
                 continue;
             }
             let w = window
@@ -472,7 +521,8 @@ impl Map {
         map
     }
 
-    /// The first ring around `cell` whose merged histograms reach `k_min` votes for some node.
+    /// The first ring around `cell` whose merged histograms reach `k_min` votes for some node; the rank lists
+    /// only the nodes that have `k_min` votes themselves.
     fn rank_votes(
         cell: Cell,
         window: &BTreeMap<Cell, BTreeMap<NodeId, Vec<u32>>>,
@@ -491,18 +541,17 @@ impl Map {
                     }
                 }
             }
-            let humans = merged
-                .values()
-                .map(|h| h.iter().sum::<u32>())
-                .max()
-                .unwrap_or(0) as usize;
-            if humans < params.k_min {
-                continue;
-            }
+            // only nodes with k votes of their own rank: with fewer, one colluding human could be the median
+            let votes = |h: &Vec<u32>| h.iter().sum::<u32>() as usize;
             let mut nodes: Vec<(NodeId, u32)> = merged
                 .iter()
+                .filter(|(_, h)| votes(h) >= params.k_min.max(1))
                 .map(|(n, h)| (n.clone(), histogram_median(h, params.bucket_ms)))
                 .collect();
+            if nodes.is_empty() {
+                continue;
+            }
+            let humans = merged.values().map(votes).max().unwrap_or(0);
             nodes.sort_by(|(na, va), (nb, vb)| (va, na).cmp(&(vb, nb)));
             return Some(CellRank {
                 humans,
@@ -675,11 +724,24 @@ mod tests {
     use super::*;
     use crate::geo::fixtures::*;
 
+    /// Accepts any well-formed token except the ones [`tok`] marks bad; the network inside is what counts.
     struct AcceptOk;
     impl TokenCheck for AcceptOk {
-        fn check(&self, token: &str, _: &NodeId, _: &str) -> bool {
-            token == "ok"
+        fn check(&self, token: &str, _: &NodeId, _: u64) -> TokenStatus {
+            match token.parse::<Token>() {
+                Ok(t) if t.mac != [0xbb; 32] => TokenStatus::Valid,
+                _ => TokenStatus::Invalid,
+            }
         }
+    }
+
+    /// A token for `label` at `ts` from a client in `prefix`; a bad one carries a MAC nobody minted.
+    fn tok(label: &str, ts: u64, prefix: &str, good: bool) -> String {
+        let mut t = token::mint(&node(label), token::minute_of(ts), &[1u8; 32], prefix);
+        if !good {
+            t.mac = [0xbb; 32];
+        }
+        t.to_string()
     }
 
     const IST_PREFIX: &str = "10.77.0.0/24";
@@ -704,7 +766,7 @@ mod tests {
             node_id: node(node_label),
             rtt_ms: rtt,
             hit_ttfb_ms: None,
-            token: token.into(),
+            token: tok(node_label, ts, IST_PREFIX, token == "ok"),
             prefix: IST_PREFIX.into(),
             ts,
             anchor: false,
@@ -743,6 +805,7 @@ mod tests {
             hit_ttfb_ms: None,
             ts: TS,
             anchor,
+            token: String::new(),
         }
     }
 
@@ -752,10 +815,10 @@ mod tests {
         let mut v = Validator::new(MapParams::v1(), &AcceptOk, &geo);
         let ist = c(ISTANBUL);
         let near = geo::disk(ist, 1)[1];
-        let mut tokyo_from_istanbul = att(c(TOKYO), "tok", 5, TS + 4, "ok");
-        tokyo_from_istanbul.prefix = IST_PREFIX.into();
+        let tokyo_from_istanbul = att(c(TOKYO), "tok", 5, TS + 4, "ok"); // the token says Istanbul
         let mut unknown = att(ist, "fra", 10, TS + 7, "ok");
-        unknown.prefix = "10.9.9.0/24".into();
+        unknown.token = tok("fra", TS + 7, "10.9.9.0/24", true);
+        unknown.prefix = IST_PREFIX.into(); // what the attester claims does not matter, the token's network does
         let b = batch(
             1,
             vec![
@@ -813,10 +876,32 @@ mod tests {
         assert_eq!(evidence.len(), 2);
         assert!(matches!(evidence[0].reason, Rejection::UnknownNode));
         assert!(matches!(evidence[1].reason, Rejection::BadToken));
-        assert!(
-            !reveals.check(&good, &node("fra"), "10.77.1.0/24"),
-            "another network, another token"
+        assert_eq!(reveals.check(&good, &node("fra"), TS), TokenStatus::Valid);
+        let moved = good.replace(".0a4d00.", ".0a4d01.");
+        assert_eq!(
+            reveals.check(&moved, &node("fra"), TS),
+            TokenStatus::Invalid,
+            "another network, the same MAC"
         );
+        assert_eq!(
+            reveals.check(&good, &node("fra"), TS + 11 * 60),
+            TokenStatus::Invalid,
+            "a token older than ten minutes backs nothing"
+        );
+        assert_eq!(reveals.check(&good, &node("tok"), TS), TokenStatus::Invalid, "another node's token");
+        let unrevealed = token::mint(&node("fra"), token::minute_of(TS + 7_200), &k.0, IST_PREFIX).to_string();
+        assert_eq!(
+            reveals.check(&unrevealed, &node("fra"), TS + 7_200),
+            TokenStatus::NoKey,
+            "no key for that hour: the node's loss, not a forgery"
+        );
+        // the first reveal of an hour counts; a later one cannot re-key it
+        reveals.add(&KeyReveal {
+            node_id: node("fra"),
+            hour: token::hour_of(TS),
+            k_hour: B256::from([7u8; 32]),
+        });
+        assert_eq!(reveals.check(&good, &node("fra"), TS), TokenStatus::Valid);
     }
 
     #[test]
@@ -922,7 +1007,9 @@ mod tests {
             (node("n1").label_hash(), node("n1")),
             (node("n2").label_hash(), node("n2")),
         ]);
-        let members = Membership::new();
+        let mut members = Membership::new();
+        members.insert(ist, BTreeSet::from([node("n1"), node("n2")]));
+        members.insert(fra, BTreeSet::from([node("n2")]));
         let p = MapParams::devnet();
         let day = TS / 86_400 * 86_400;
         let events = vec![
@@ -962,6 +1049,15 @@ mod tests {
         };
         let map = Map::from_votes(&events[4..5], &members, &labels, day + 400, &strict);
         assert!(map.rank(ist).is_none());
+        // k counts per node: n1 has three votes and ranks, n2 has one and does not
+        let map = Map::from_votes(&events, &members, &labels, day + 400, &strict);
+        assert_eq!(map.rank(ist).unwrap().nodes, vec![(node("n1"), 44)]);
+        // a node that left the cell keeps no rank there, whatever votes it had
+        let mut left = members.clone();
+        left.get_mut(&ist).unwrap().remove(&node("n1"));
+        let map = Map::from_votes(&events, &left, &labels, day + 400, &p);
+        assert_eq!(map.rank(ist).unwrap().nodes, vec![(node("n2"), 4)]);
+        assert!(!map.voters[&ist].contains_key(&node("n1")));
     }
 
     #[test]

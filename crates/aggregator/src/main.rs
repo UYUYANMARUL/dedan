@@ -8,7 +8,8 @@
 //!   recompute DIR  anyone: reproduce a period's roots from `DIR/inputs` and compare with `DIR/outputs`
 //!   report DIR     the period in plain text: quality, multipliers, pay, evidence, roots
 //!   proof DIR WHO  a payee's cumulative amount and Merkle proof for `Settlement.claim`
-//!   publish DIR    (re)publish a period from disk, e.g. after governance voided it and the dispute was settled
+//!   publish DIR    (re)publish a period from disk by hand: after governance voided it and the dispute was
+//!                  settled (the loop never republishes a voided period on its own)
 
 mod chain;
 mod settle;
@@ -28,7 +29,7 @@ use axum::extract::State;
 use axum::http::StatusCode;
 use axum::routing::{get, post};
 use axum::{Json, Router};
-use dedan_core::config::{self, AccountCfg, Deployment, Geo};
+use dedan_core::config::{self, Deployment, Geo};
 use dedan_core::ens::EnsClient;
 use dedan_core::envelope::{Envelope, EnvelopeError, NonceCache};
 use dedan_core::identity::Identity;
@@ -48,7 +49,8 @@ type Error = Box<dyn std::error::Error + Send + Sync>;
 struct Cfg {
     rpc_url: String,
     deployment: PathBuf,
-    accounts: PathBuf,
+    /// The control plane: the account-signed configs a period bills.
+    cp_url: String,
     hosts: Vec<PathBuf>,
     parent: String,
     data: PathBuf,
@@ -56,6 +58,7 @@ struct Cfg {
     grace_secs: u64,
     sample_n: usize,
     map_k: usize,
+    auditors_per_account: usize,
     listen: String,
     countersigner: String,
 }
@@ -66,14 +69,15 @@ impl Cfg {
         Ok(Self {
             rpc_url: get("DEDAN_RPC_URL", "http://anvil:8545"),
             deployment: get("DEDAN_DEPLOYMENT", "/deployments/devnet.json").into(),
-            accounts: get("DEDAN_ACCOUNTS", "/devnet/accounts.json").into(),
+            cp_url: get("DEDAN_CP_URL", "http://cp:8070").trim_end_matches('/').to_owned(),
             hosts: config::paths(&get("DEDAN_HOSTS", "/wan/hosts.txt")),
             parent: get("DEDAN_PARENT", "dedan.eth"),
             data: get("DEDAN_DATA", "/data").into(),
-            period_secs: get("DEDAN_PERIOD_SECS", "3600").parse()?,
-            grace_secs: get("DEDAN_GRACE_SECS", "10").parse()?,
+            period_secs: get("DEDAN_PERIOD_SECS", "86400").parse()?,
+            grace_secs: get("DEDAN_GRACE_SECS", "3600").parse()?,
             sample_n: get("DEDAN_SAMPLE_N", "4").parse()?,
-            map_k: get("DEDAN_MAP_K", "1").parse()?,
+            map_k: get("DEDAN_MAP_K", "3").parse()?,
+            auditors_per_account: get("DEDAN_AUDITORS_PER_ACCOUNT", "5").parse()?,
             listen: get("DEDAN_LISTEN", default_listen),
             countersigner: get("DEDAN_COUNTERSIGNER", "http://countersigner:8061"),
         })
@@ -155,16 +159,31 @@ impl App {
         Ok(())
     }
 
+    /// The account configs the control plane relays, as it relays them: `compute` keeps only the ones the
+    /// account keys signed.
+    async fn configs(&self) -> Result<Vec<Envelope<AccountConfig>>, Error> {
+        let v: Value = self
+            .http
+            .get(format!("{}/v1/configs", self.cfg.cp_url))
+            .send()
+            .await?
+            .error_for_status()?
+            .json()
+            .await?;
+        Ok(serde_json::from_value(v["configs"].clone())?)
+    }
+
     /// The customer's asset list and the day's sample of it, digested from the origin: what the control
     /// plane publishes hourly in production and the aggregator does itself on the devnet.
-    async fn digests(&self, configs: &[AccountCfg], start: u64, prev: &[AssetSample]) -> Vec<AssetSample> {
+    async fn digests(&self, configs: &[AccountConfig], start: u64, prev: &[AssetSample]) -> Vec<AssetSample> {
         let mut out = Vec::new();
         for a in configs {
-            if a.origin.is_empty() || a.asset_list.is_empty() {
+            let Some(origin) = a.origins.first() else { continue };
+            if a.asset_list.is_empty() {
                 continue;
             }
-            let base = a.origin.trim_end_matches('/');
-            let manifest: Vec<String> = match self.http.get(format!("{base}{}", a.asset_list)).send().await {
+            let base = origin.url.trim_end_matches('/');
+            let manifest: Vec<String> = match self.http.get(&a.asset_list).send().await {
                 Ok(r) => r
                     .text()
                     .await
@@ -175,11 +194,11 @@ impl App {
                     .map(str::to_owned)
                     .collect(),
                 Err(e) => {
-                    warn!(account = %a.label, error = %e, "asset list unreachable; no digests this period");
+                    warn!(account = %a.account_id, error = %e, "asset list unreachable; no digests this period");
                     continue;
                 }
             };
-            let sample = schedule::sample_assets(schedule::seed_of(start), &a.id(), &manifest, self.cfg.sample_n);
+            let sample = schedule::sample_assets(schedule::seed_of(start), &a.account_id, &manifest, self.cfg.sample_n);
             let mut assets = Vec::new();
             for path in sample {
                 let Ok(r) = self.http.get(format!("{base}{path}")).send().await else {
@@ -193,7 +212,7 @@ impl App {
                 let Ok(body) = r.bytes().await else { continue };
                 let previous = prev
                     .iter()
-                    .filter(|s| s.account_id == a.id())
+                    .filter(|s| s.account_id == a.account_id)
                     .flat_map(|s| s.assets.iter())
                     .find(|d| d.path == path)
                     .map(|d| d.sha256_current.clone());
@@ -206,7 +225,7 @@ impl App {
                 });
             }
             out.push(AssetSample {
-                account_id: a.id(),
+                account_id: a.account_id.clone(),
                 hour: start / 3600,
                 assets,
             });
@@ -215,16 +234,17 @@ impl App {
     }
 
     /// Closes the wall-clock period `w`: writes the inputs and outputs of contract period `lastPeriod + 1`
-    /// and publishes them. A voided predecessor is republished first.
+    /// and publishes them. A voided period stops the loop: a void is a dispute, and publishing the same roots
+    /// again at the next close would turn it into a delay; an operator republishes by hand (`publish DIR`)
+    /// once the dispute is settled, after fixing the inputs if they were wrong.
     async fn close(&self, w: u64) -> Result<PathBuf, Error> {
         let (last, voided) = chain::last_period(&self.provider, self.dep.settlement).await?;
         if voided {
-            let dir = self.period_dir(last);
-            if !dir.join("outputs").join("roots.json").exists() {
-                return Err(format!("period {last} was voided and is not on disk").into());
-            }
-            info!(period = last, "republishing the voided period from disk");
-            self.publish_dir(&dir).await?;
+            return Err(format!(
+                "period {last} is voided: waiting for `dedan-aggregator publish {}` once the dispute is settled",
+                self.period_dir(last).display()
+            )
+            .into());
         }
         let n = last + 1;
         let (prev, prev_samples, prev_outputs_hash) = if last == 0 {
@@ -253,10 +273,20 @@ impl App {
         }
         let nodes = self.ens.node_records(identity.nodes.keys()).await?;
         let geo = Geo::from_files(&self.cfg.hosts);
-        let configs = AccountCfg::load_all(&self.cfg.accounts)?;
+        let configs = self.configs().await?;
+        let payloads: Vec<AccountConfig> = configs.iter().map(|e| e.payload.clone()).collect();
+        let accounts = chain::chain_accounts(&self.provider, self.dep.settlement, head).await?;
+        let prices = chain::tier_prices(
+            &self.provider,
+            self.dep.settlement,
+            settle::PRICE_TABLE_VERSION,
+            payloads.iter().map(|c| c.tier),
+            head,
+        )
+        .await?;
         let start = w * self.cfg.period_secs;
         let end = start + self.cfg.period_secs;
-        let samples = self.digests(&configs, start, &prev_samples).await;
+        let samples = self.digests(&payloads, start, &prev_samples).await;
         let probes: Vec<Envelope<ProbeBatch>> = {
             let _guard = self.inbox.lock().await;
             match std::fs::read_to_string(self.inbox_file(w)) {
@@ -283,6 +313,7 @@ impl App {
             period_secs: self.cfg.period_secs,
             sample_n: self.cfg.sample_n,
             map_k: self.cfg.map_k,
+            auditors_per_account: self.cfg.auditors_per_account,
             prev_outputs_hash,
             files: BTreeMap::new(),
         };
@@ -292,6 +323,8 @@ impl App {
             probes,
             samples,
             configs,
+            accounts,
+            prices,
             nodes,
             geo,
             prev,
@@ -389,6 +422,10 @@ impl App {
         if events != inputs.events {
             return Err("the inputs' registry events differ from the chain".into());
         }
+        self.check_chain_inputs(&inputs, theirs.registry_block).await?;
+        let periods_dir = dir.parent().ok_or("period dir has no parent")?.to_path_buf();
+        self.check_previous(periods_dir, inputs.prev.clone(), theirs.period).await?;
+        self.check_digests(&inputs).await?;
         let (last, voided) = chain::last_period(&self.provider, self.dep.settlement)
             .await
             .map_err(|e| e.to_string())?;
@@ -407,6 +444,134 @@ impl App {
             sig: format!("0x{}", hex::encode(sig.as_bytes())),
             address: self.key.address(),
         })
+    }
+
+    /// Everything in the inputs that comes from the chain, read again at `registry_block` by this key's own
+    /// RPC: the nodes' records (payout addresses among them), the accounts and their balances, the tier prices
+    /// and the block's clock. The aggregator could otherwise pay whoever it wrote into `nodes.json`.
+    async fn check_chain_inputs(&self, inp: &Inputs, block: u64) -> Result<(), String> {
+        let mut identity = Identity::default();
+        for e in &inp.events {
+            identity.apply(e);
+        }
+        let err = |e: Error| e.to_string();
+        let nodes = self
+            .ens
+            .at_block(block)
+            .node_records(identity.nodes.keys())
+            .await
+            .map_err(err)?;
+        if nodes != inp.nodes {
+            return Err("nodes.json differs from the names' records at the registry block".into());
+        }
+        let accounts = chain::chain_accounts(&self.provider, self.dep.settlement, block).await.map_err(err)?;
+        if accounts != inp.accounts {
+            return Err("accounts.json differs from the Settlement contract at the registry block".into());
+        }
+        let tiers: Vec<Tier> = inp.prices.iter().map(|p| p.tier).collect();
+        let prices = chain::tier_prices(
+            &self.provider,
+            self.dep.settlement,
+            inp.manifest.price_table_version,
+            tiers,
+            block,
+        )
+        .await
+        .map_err(err)?;
+        if prices != inp.prices {
+            return Err("prices.json differs from the price table at the registry block".into());
+        }
+        let time = dedan_core::identity::block_time(&self.provider, block).await.map_err(err)?;
+        if time != inp.manifest.chain_time {
+            return Err(format!("chain_time {} is not block {block}'s time {time}", inp.manifest.chain_time));
+        }
+        Ok(())
+    }
+
+    /// `prev.json` must be what the previous period's own inputs give: those inputs are the ones whose hash is
+    /// on chain for that period, and recomputed they must reproduce its published roots. The aggregator could
+    /// otherwise inflate a cumulative leaf or a rollover.
+    async fn check_previous(&self, periods_dir: PathBuf, prev: Prev, period: u64) -> Result<(), String> {
+        if period <= 1 {
+            return if prev == Prev::default() {
+                Ok(())
+            } else {
+                Err("the first period carries a previous state".into())
+            };
+        }
+        let prev_dir = periods_dir.join((period - 1).to_string());
+        let (inputs_hash, payout_root, bill_root, voided) =
+            chain::root_of(&self.provider, self.dep.settlement, period - 1)
+                .await
+                .map_err(|e| e.to_string())?;
+        if voided {
+            return Err(format!("period {} is voided", period - 1));
+        }
+        let hash = Inputs::inputs_hash(&prev_dir).map_err(|e| e.to_string())?;
+        if hash != inputs_hash {
+            return Err(format!("period {}'s inputs on disk are not the ones on chain", period - 1));
+        }
+        let prev_inputs = Inputs::read(&prev_dir).map_err(|e| e.to_string())?;
+        let out = settle::compute(&prev_inputs, hash).map_err(|e| e.to_string())?;
+        if out.roots.payout_root != payout_root || out.roots.bill_root != bill_root {
+            return Err(format!("period {} does not recompute to its published roots", period - 1));
+        }
+        if out.next != prev {
+            return Err("prev.json is not what the previous period's inputs give".into());
+        }
+        Ok(())
+    }
+
+    /// The origin digests, taken again from the origin: current or previous must match what was fetched.
+    /// ponytail: an origin that changes twice between the two fetches fails the period, which the next close
+    /// retries; digests signed by the control plane (M4) replace the second fetch
+    async fn check_digests(&self, inp: &Inputs) -> Result<(), String> {
+        for sample in &inp.samples {
+            let Some(origin) = inp
+                .configs
+                .iter()
+                .filter(|e| e.payload.account_id == sample.account_id)
+                .max_by_key(|e| e.payload.version)
+                .and_then(|e| e.payload.origins.first())
+            else {
+                continue;
+            };
+            let base = origin.url.trim_end_matches('/');
+            for d in &sample.assets {
+                let body = self
+                    .http
+                    .get(format!("{base}{}", d.path))
+                    .send()
+                    .await
+                    .map_err(|e| format!("{}: {e}", d.path))?
+                    .bytes()
+                    .await
+                    .map_err(|e| format!("{}: {e}", d.path))?;
+                let sha = settle::sha256_hex(&body);
+                if sha != d.sha256_current && d.sha256_previous.as_deref() != Some(&sha) {
+                    return Err(format!("{} of {}: the origin serves {sha}, not the digest in the inputs", d.path, sample.account_id));
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// The latest published period's sets, quality and cumulative bills: what resolvers and auditors make
+    /// today's sets sticky on, so all of them answer, probe and pay the same sets. Periods above the chain's
+    /// `lastPeriod` were dropped by a void and do not count.
+    fn previous(&self, last_on_chain: u64) -> Option<Value> {
+        let latest = self
+            .periods()
+            .into_iter()
+            .filter(|p| p["published"].as_bool() == Some(true))
+            .filter(|p| p["period"].as_u64().is_some_and(|n| n <= last_on_chain))
+            .max_by_key(|p| p["period"].as_u64())?;
+        let dir = PathBuf::from(latest["dir"].as_str()?);
+        let prev = settle::read_prev(&dir).ok()?;
+        Some(json!({
+            "period": latest["period"], "assignment": prev.assignment, "quality": prev.quality,
+            "bills": prev.cumulative.bill,
+        }))
     }
 
     fn periods(&self) -> Vec<Value> {
@@ -492,6 +657,13 @@ async fn periods(State(s): State<Arc<App>>) -> Json<Value> {
     Json(json!({ "period_secs": s.cfg.period_secs, "periods": s.periods() }))
 }
 
+async fn previous(State(s): State<Arc<App>>) -> Result<Json<Value>, StatusCode> {
+    let (last, _) = chain::last_period(&s.provider, s.dep.settlement)
+        .await
+        .map_err(|_| StatusCode::SERVICE_UNAVAILABLE)?;
+    s.previous(last).map(Json).ok_or(StatusCode::NOT_FOUND)
+}
+
 async fn countersign(
     State(s): State<Arc<App>>,
     Json(body): Json<DirBody>,
@@ -522,6 +694,7 @@ async fn serve(app: Arc<App>) -> Result<(), Error> {
     let router = Router::new()
         .route("/health", get(health))
         .route("/periods", get(periods))
+        .route("/v1/previous", get(previous))
         .route("/v1/probe-results", post(probe_results))
         .with_state(app.clone());
     let listener = tokio::net::TcpListener::bind(&app.cfg.listen).await?;
@@ -607,19 +780,31 @@ fn report(dir: &Path) -> Result<(), Error> {
         rejected.len(),
         inputs.samples.iter().map(|s| s.assets.len()).sum::<usize>()
     );
-    for a in &inputs.configs {
-        let Some(mu) = score.multipliers.get(&a.id()) else { continue };
+    let mut accounts: BTreeMap<AccountId, &AccountConfig> = BTreeMap::new();
+    for e in &inputs.configs {
+        let c = &e.payload;
+        if accounts.get(&c.account_id).is_none_or(|h| h.version < c.version) {
+            accounts.insert(c.account_id.clone(), c);
+        }
+    }
+    for a in accounts.values() {
+        let Some(mu) = score.multipliers.get(&a.account_id) else { continue };
+        let unfunded = if mu.unfunded > 0 {
+            format!(", {} USDC unfunded (balance)", usdc(mu.unfunded))
+        } else {
+            String::new()
+        };
         println!(
-            "account {}: list {} USDC x {:.3} = bill {} USDC (credit {}); availability {:.3} (s {:.2}), delivered {}/{} (s {:.2}), throughput s {:.2}",
-            a.label,
+            "account {}: list {} USDC x {:.3} = bill {} USDC (credit {}{unfunded}); availability {:.3} (s {:.2}), delivered {}/{} (s {:.2}), throughput s {:.2}",
+            a.account_id,
             usdc(mu.list),
             mu.mult,
             usdc(mu.bill),
             usdc(mu.credit),
             mu.availability,
             mu.s_availability,
-            ((1.0 - mu.s_nodes) * a.nodes as f64).round() as u32,
-            a.nodes,
+            ((1.0 - mu.s_nodes) * a.tier.nodes as f64).round() as u32,
+            a.tier.nodes,
             mu.s_nodes,
             mu.s_throughput
         );
@@ -630,7 +815,7 @@ fn report(dir: &Path) -> Result<(), Error> {
             usdc(mu.rollover_next)
         );
         println!("   {:<14}{:>8}{:>11}{:>12}{:>9}{:>5}{:>6}{:>14}", "node", "uptime", "integrity", "throughput", "quality", "up", "fail", "paid USDC");
-        if let Some(q) = score.quality.get(&a.id()) {
+        if let Some(q) = score.quality.get(&a.account_id) {
             for (n, x) in q {
                 println!(
                     "   {:<14}{:>8.2}{:>11.2}{:>12.2}{:>9.2}{:>5}{:>6}{:>14}",
@@ -685,8 +870,9 @@ fn describe(e: &ScoreEvidence) -> String {
             short(auditor.0)
         ),
         ScoreEvidence::OutlierAuditor { auditor, account, node, rate, others } => format!(
-            "outlier_auditor: {} failed {node} for {account} at {rate:.2} against the others' {others:.2}: suspended for the day",
-            short(auditor.0)
+            "outlier_auditor: {} failed {} for {account} at {rate:.2} against the others' {others:.2}: suspended for the day",
+            short(auditor.0),
+            node.as_ref().map(|n| n.0.as_str()).unwrap_or("the landing probes")
         ),
         ScoreEvidence::Unmeasured { account, node } => format!("unmeasured: {node} had no valid probe for {account}: uptime 0"),
         ScoreEvidence::SpoofedAttestation(ev) => format!(

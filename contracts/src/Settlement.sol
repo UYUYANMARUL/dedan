@@ -59,11 +59,19 @@ contract Settlement is Ownable2Step {
     mapping(uint64 period => Root) public roots;
     uint64 public lastPeriod;
     uint256 public totalDeposited;
+    /// @notice What customers took back; bills are bounded by `totalDeposited - totalWithdrawn`.
+    uint256 public totalWithdrawn;
     address[] public signers;
     mapping(address => bool) public isSigner;
     uint8 public threshold;
-    mapping(uint32 version => bytes32) public priceTable;
+    /// @notice List prices in USDC (6 decimals) per day, by price table version and tier (`tierKey`).
+    mapping(uint32 version => mapping(bytes32 tier => uint256 usdcPerDay)) public prices;
+    mapping(uint32 version => bool) public priceVersionSet;
     mapping(address => uint256) public bonds;
+    /// @notice A signer's signature counts toward the threshold only while its bond is at least this.
+    uint256 public minSignerBond;
+    /// @notice Signs new account ids (the control plane), so an id is reserved to the key it names.
+    address public registrar;
 
     event AccountCreated(bytes32 indexed id, address key);
     event Deposited(bytes32 indexed id, address from, uint256 amount);
@@ -80,8 +88,11 @@ contract Settlement is Ownable2Step {
         uint256 totalCumBill
     );
     event RootVoided(uint64 indexed period, address by);
+    event RootsDropped(uint64 fromPeriod, uint64 toPeriod);
     event SignerSetUpdated(address[] signers, uint8 threshold);
-    event PriceTableSet(uint32 indexed version, bytes32 hash);
+    event PriceSet(uint32 indexed version, bytes32 indexed tier, uint256 usdcPerDay);
+    event MinSignerBondSet(uint256 amount);
+    event RegistrarSet(address registrar);
     event BondDeposited(address indexed who, uint256 amount);
     event BondSlashed(address indexed who, uint256 amount, address to);
     event BondReleased(address indexed who, uint256 amount);
@@ -105,6 +116,7 @@ contract Settlement is Ownable2Step {
     error BadProof();
     error NothingToClaim();
     error BadSignerSet();
+    error BadRegistrarSig();
 
     constructor(IERC20 usdc_, address governance) Ownable(governance) {
         usdc = usdc_;
@@ -112,9 +124,14 @@ contract Settlement is Ownable2Step {
 
     // ---- accounts -----------------------------------------------------------------------------
 
-    function createAccount(bytes32 id, address key) external {
+    /// @notice Creates account `id` for `key`. `registrarSig` is the registrar's EIP-191 signature over
+    ///         `keccak256(abi.encode(block.chainid, address(this), id, key))`.
+    function createAccount(bytes32 id, address key, bytes calldata registrarSig) external {
         if (key == address(0)) revert ZeroAddress();
         if (accounts[id].key != address(0)) revert AccountExists();
+        bytes32 h =
+            MessageHashUtils.toEthSignedMessageHash(keccak256(abi.encode(block.chainid, address(this), id, key)));
+        if (ECDSA.recover(h, registrarSig) != registrar) revert BadRegistrarSig();
         accounts[id].key = key;
         emit AccountCreated(id, key);
     }
@@ -156,6 +173,7 @@ contract Settlement is Ownable2Step {
         if (amount > a.balance) amount = a.balance;
         a.pendingWithdrawal = 0;
         a.balance -= amount;
+        totalWithdrawn += amount;
         usdc.safeTransfer(a.key, amount);
         emit Withdrawn(id, amount, billApplied);
     }
@@ -191,16 +209,15 @@ contract Settlement is Ownable2Step {
 
     // ---- roots --------------------------------------------------------------------------------
 
-    /// One call per period, `threshold` distinct signers over `digest(r)`. A voided period is republished
-    /// under the same number. Totals are cumulative and can never decrease; payouts never exceed bills and
-    /// bills never exceed what customers have deposited in total.
+    /// One call per period, `threshold` distinct bonded signers over `digest(r)`. A voided period is republished
+    /// under the same number before the next one. Totals are cumulative and can never decrease; payouts never
+    /// exceed bills and bills never exceed what customers have deposited and not withdrawn.
     function publishRoot(RootInput calldata r, bytes[] calldata sigs) external {
-        if (r.period == 0) revert BadPeriod();
-        bool republish = r.period == lastPeriod && roots[lastPeriod].voided;
-        if (!republish && r.period != lastPeriod + 1) revert BadPeriod();
-        if (priceTable[r.priceTableVersion] == bytes32(0)) revert UnknownPriceTable();
+        // only the latest period can be voided (voiding an earlier one drops the later ones)
+        if (r.period != (roots[lastPeriod].voided ? lastPeriod : lastPeriod + 1)) revert BadPeriod();
+        if (!priceVersionSet[r.priceTableVersion]) revert UnknownPriceTable();
         if (r.totalCumPayout > r.totalCumBill) revert PayoutExceedsBill();
-        if (r.totalCumBill > totalDeposited) revert BillExceedsDeposits();
+        if (r.totalCumBill > totalDeposited - totalWithdrawn) revert BillExceedsDeposits();
         Root storage prev = roots[r.period - 1];
         if (r.totalCumPayout < prev.totalCumPayout || r.totalCumBill < prev.totalCumBill) revert NotMonotonic();
         _checkSignatures(digest(r), sigs);
@@ -244,28 +261,37 @@ contract Settlement is Ownable2Step {
         for (uint256 i = 0; i < sigs.length; i++) {
             address s = ECDSA.recover(h, sigs[i]);
             if (!isSigner[s]) revert BadSignatures();
-            for (uint256 j = 0; j < valid; j++) {
+            for (uint256 j = 0; j < i; j++) {
                 if (seen[j] == s) revert BadSignatures();
             }
-            seen[valid++] = s;
+            seen[i] = s;
+            if (bonds[s] >= minSignerBond) valid++; // an unbonded signer's signature is ignored
         }
         if (valid < threshold) revert BadSignatures();
     }
 
-    /// Any signer or governance can void the latest root while its window is open.
+    /// @notice Any signer or governance can void a root while its own window is open. The roots published after
+    ///         it were computed on top of it and are dropped with it: `lastPeriod` rolls back to `period`, which
+    ///         has to be republished before the next one.
     function voidRoot(uint64 period) external {
         if (!isSigner[msg.sender] && msg.sender != owner()) revert NotSigner();
         Root storage rt = roots[period];
-        if (period == 0 || period != lastPeriod || rt.publishedAt == 0) revert BadPeriod();
+        if (period == 0 || period > lastPeriod) revert BadPeriod();
         if (rt.voided) revert AlreadyVoided();
         if (block.timestamp >= rt.publishedAt + DISPUTE_WINDOW) revert WindowClosed();
         rt.voided = true;
         emit RootVoided(period, msg.sender);
+        if (period < lastPeriod) {
+            emit RootsDropped(period + 1, lastPeriod);
+            lastPeriod = period;
+        }
     }
 
     function isFinal(uint64 period) public view returns (bool) {
         Root storage rt = roots[period];
-        return rt.publishedAt != 0 && !rt.voided && block.timestamp >= rt.publishedAt + DISPUTE_WINDOW;
+        return
+            period <= lastPeriod && rt.publishedAt != 0 && !rt.voided
+                && block.timestamp >= rt.publishedAt + DISPUTE_WINDOW;
     }
 
     function latestFinalPeriod() public view returns (uint64 p) {
@@ -294,9 +320,27 @@ contract Settlement is Ownable2Step {
         return signers.length;
     }
 
-    function setPriceTable(uint32 version, bytes32 hash) external onlyOwner {
-        priceTable[version] = hash;
-        emit PriceTableSet(version, hash);
+    /// @notice Sets the list price of a tier in a price table version; a root may name a version once it has one.
+    function setPrice(uint32 version, bytes32 tier, uint256 usdcPerDay) external onlyOwner {
+        prices[version][tier] = usdcPerDay;
+        priceVersionSet[version] = true;
+        emit PriceSet(version, tier, usdcPerDay);
+    }
+
+    /// @notice The tier key of `prices`: node count, bandwidth class in Mbps, availability in basis points
+    ///         (6 nodes, 100 Mbps, 99.9 % → `tierKey(6, 100, 9990)`).
+    function tierKey(uint16 nodes, uint32 classMbps, uint32 availabilityBps) external pure returns (bytes32) {
+        return keccak256(abi.encode(nodes, classMbps, availabilityBps));
+    }
+
+    function setMinSignerBond(uint256 amount) external onlyOwner {
+        minSignerBond = amount;
+        emit MinSignerBondSet(amount);
+    }
+
+    function setRegistrar(address registrar_) external onlyOwner {
+        registrar = registrar_;
+        emit RegistrarSet(registrar_);
     }
 
     // Bonds of the aggregator and countersigner. ponytail: release is governance-gated in v1; a timed

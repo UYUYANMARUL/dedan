@@ -15,11 +15,12 @@ import {MockUSDC} from "../src/mocks/MockUSDC.sol";
 import {Merkle} from "../test/Merkle.sol";
 
 /// One settlement day on the devnet, in two stages separated by a 73 h clock jump (deploy/scripts/smoke.sh):
-///   STAGE=1  the customer funds account "acme" and requests a partial withdrawal; a World ID-verified operator
-///            registers the node name `smoke.dedan.eth` with its records and a hot key; an attester and an auditor
-///            verify and register; the hot key reveals a token key; the attester attests; the records resolve
-///            through the Universal Resolver; the operator changes the node's IP record; the aggregator and
-///            countersigner bond and publish the period-1 roots (node 80, treasury 20, bill 100).
+///   STAGE=1  the customer requests a partial withdrawal from account "acme" (created and funded with 10,000 USDC by
+///            the deployment); a World ID-verified operator registers the node name `smoke.dedan.eth` with its
+///            records and a hot key; an attester and an auditor verify and register; the hot key reveals a token key;
+///            the attester attests; the records resolve through the Universal Resolver; the operator changes the
+///            node's IP record; the aggregator and countersigner (bonded by the deployment) publish the period-1
+///            roots (node 80, treasury 20, bill 100).
 ///   STAGE=2  the operator claims its 80 USDC, the customer's 100 USDC bill is applied and 500 USDC withdrawn.
 contract Smoke is Script {
     string constant MNEMONIC = "test test test test test test test test test test test junk";
@@ -70,10 +71,9 @@ contract Smoke is Script {
         address op = vm.addr(opPk);
         address treasury = vm.addr(govPk);
 
+        (address key, uint256 funded,,,) = settlement.accounts(ACME);
+        require(key == customer && funded == 10_000e6, "acme is created and funded by the deployment");
         vm.startBroadcast(customerPk);
-        usdc.approve(address(settlement), 10_000e6);
-        settlement.createAccount(ACME, customer);
-        settlement.deposit(ACME, 10_000e6);
         settlement.requestWithdraw(ACME, 500e6);
         vm.stopBroadcast();
 
@@ -136,15 +136,6 @@ contract Smoke is Script {
         resolver.setDNSRecords(node, LibDnsWire.a(name, 60, 0x0a4d0064)); // 10.77.0.100
         vm.stopBroadcast();
 
-        vm.startBroadcast(aggPk);
-        usdc.approve(address(settlement), 20_000e6);
-        settlement.depositBond(20_000e6);
-        vm.stopBroadcast();
-        vm.startBroadcast(cosPk);
-        usdc.approve(address(settlement), 20_000e6);
-        settlement.depositBond(20_000e6);
-        vm.stopBroadcast();
-
         bytes32 nodeLeaf = Merkle.leaf(abi.encode(op, uint256(80e6)));
         bytes32 treasuryLeaf = Merkle.leaf(abi.encode(treasury, uint256(20e6)));
         Settlement.RootInput memory r = Settlement.RootInput({
@@ -165,7 +156,7 @@ contract Smoke is Script {
         settlement.publishRoot(r, sigs);
         vm.stopBroadcast();
 
-        console2.log("stage 1: account acme funded with 10000 USDC, 500 USDC withdrawal requested");
+        console2.log("stage 1: account acme (10000 USDC from the deployment) requested a 500 USDC withdrawal");
         console2.log(
             "stage 1: smoke.dedan.eth registered (token %s), records resolve through the Universal Resolver", tokenId
         );

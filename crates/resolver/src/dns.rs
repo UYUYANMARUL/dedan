@@ -22,6 +22,8 @@ use crate::state::State;
 
 const TTL_STEER: u32 = 30;
 const TTL_NODE: u32 = 60;
+/// ACME challenge records (§3): short enough that a renewal's new value is seen within a minute.
+const TTL_TXT: u32 = 60;
 const ANSWERS: usize = 3;
 
 pub struct Handler {
@@ -215,7 +217,7 @@ impl Handler {
                 {
                     a.records.push(Record::from_rdata(
                         name(qname),
-                        0,
+                        TTL_TXT,
                         RData::TXT(TXT::new(vec![v])),
                     ));
                 }
@@ -235,7 +237,7 @@ impl Handler {
                     }
                 }
                 RecordType::AAAA => {
-                    if let Some(ip) = rec.ipv6 {
+                    if let Some(ip) = self.state.verified_ip6(&NodeId::new(label), rec.ipv6) {
                         a.records.push(Record::from_rdata(
                             name(qname),
                             TTL_NODE,
@@ -252,6 +254,10 @@ impl Handler {
         }
         // <account>: the slot set, ordered by the latency map for the client's cell
         let account = AccountId::new(rel);
+        if self.state.is_suspended(&account) {
+            // the account cannot pay for the service it would get (§8): its names are not answered
+            return a;
+        }
         let snap = self.state.snap.read().await;
         let Some(set) = snap.assignment.sets.get(&account) else {
             return if self.state.accounts().iter().any(|x| x.id == account) {

@@ -48,6 +48,7 @@ contract DedanRegistryTest is Test {
     uint256 nextNullifier = 1;
 
     function setUp() public {
+        vm.warp(1_790_000_000);
         usdc = new MockUSDC();
         worldId = new MockWorldID();
         labelStore = new LabelStore(IContractNamer(address(0)));
@@ -68,6 +69,7 @@ contract DedanRegistryTest is Test {
         );
         dedan.setMinStake(DedanRegistry.StakeKind.Node, 1_000e6);
         dedan.setMinStake(DedanRegistry.StakeKind.Auditor, 100e6);
+        dedan.setMinStake(DedanRegistry.StakeKind.Resolver, 1_000e6);
         vm.stopPrank();
 
         address[7] memory actors = [op1, op2, hot1, hot2, attester, auditor, stranger];
@@ -202,7 +204,7 @@ contract DedanRegistryTest is Test {
         dedan.revealKey("fra", 5, bytes32(uint256(9)));
         vm.prank(stranger);
         vm.expectPartialRevert(IEnhancedAccessControl.EACUnauthorizedAccountRoles.selector);
-        dedan.revealKey("fra", 5, bytes32(0));
+        dedan.revealKey("fra", 6, bytes32(0));
 
         vm.prank(attester);
         dedan.registerAttester(proof(50));
@@ -210,6 +212,34 @@ contract DedanRegistryTest is Test {
         vm.prank(gov);
         dedan.suspendAccount(attester, true);
         assertFalse(dedan.isAttester(attester));
+    }
+
+    function test_revealKey_once_per_hour_after_the_hour_unless_early() public {
+        registerFra(op1);
+        uint64 hour = uint64(block.timestamp / 3600);
+        vm.startPrank(hot1);
+        vm.expectRevert(DedanRegistry.RevealTooEarly.selector);
+        dedan.revealKey("fra", hour, bytes32(uint256(1)));
+        dedan.revealKey("fra", hour - 1, bytes32(uint256(1)));
+        assertTrue(dedan.revealed(labelId(), hour - 1));
+        vm.expectRevert(DedanRegistry.AlreadyRevealed.selector);
+        dedan.revealKey("fra", hour - 1, bytes32(uint256(2))); // the first reveal stands
+        vm.warp((uint256(hour) + 1) * 3600); // the hour just ended
+        dedan.revealKey("fra", hour, bytes32(uint256(3)));
+        vm.stopPrank();
+
+        // the devnet switch: the current hour at once, still once
+        vm.prank(stranger);
+        vm.expectPartialRevert(IEnhancedAccessControl.EACUnauthorizedAccountRoles.selector);
+        dedan.setEarlyReveal(true);
+        vm.prank(gov);
+        dedan.setEarlyReveal(true);
+        assertTrue(dedan.earlyReveal());
+        vm.startPrank(hot1);
+        dedan.revealKey("fra", hour + 1, bytes32(uint256(4)));
+        vm.expectRevert(DedanRegistry.AlreadyRevealed.selector);
+        dedan.revealKey("fra", hour + 1, bytes32(uint256(5)));
+        vm.stopPrank();
     }
 
     function test_owner_rewrites_records_and_nobody_else_can() public {
@@ -253,7 +283,22 @@ contract DedanRegistryTest is Test {
         assertEq(dedan.nodeOwner("fra"), address(0));
         assertEq(dedan.nodeStake(id), 0);
         assertFalse(dedan.isNodeSigner("fra", hot2), "old roles die with the EAC version");
+        assertEq(address(resolver.addr(node())), address(0), "records cleared with the name");
+        assertEq(resolver.text(node(), "dedan.class"), "");
+        assertEq(resolver.dnsRecord(node(), keccak256(name()), 1).length, 0);
 
+        // the label rests until the start of the second UTC day after the withdrawal
+        uint256 reusable = (block.timestamp / 1 days + 2) * 1 days;
+        assertEq(dedan.reusableAt(id), reusable);
+        vm.startPrank(op2);
+        dedan.registerOperator(proof(nextNullifier++));
+        vm.expectRevert(DedanRegistry.LabelCooling.selector);
+        dedan.registerNode("fra", new address[](0), 1_000e6);
+        vm.warp(reusable - 1);
+        vm.expectRevert(DedanRegistry.LabelCooling.selector);
+        dedan.registerNode("fra", new address[](0), 1_000e6);
+        vm.stopPrank();
+        vm.warp(reusable);
         registerFra(op2);
         assertEq(dedan.nodeOwner("fra"), op2);
         assertTrue(dedan.isNodeSigner("fra", hot1));
@@ -271,12 +316,62 @@ contract DedanRegistryTest is Test {
         assertFalse(dedan.isNodeActive("fra"));
         assertEq(dedan.nodeOwner("fra"), op1, "suspension keeps the name");
         vm.prank(gov);
+        dedan.suspendNode("fra", false);
+        assertTrue(dedan.isNodeActive("fra"));
+
+        // a slash below the minimum stake takes the node out
+        vm.prank(gov);
+        dedan.slashNode("fra", 1, stranger);
+        assertEq(dedan.nodeStake(labelId()), 1_000e6 - 1);
+        assertFalse(dedan.isNodeActive("fra"), "below the minimum stake");
+        vm.prank(gov);
         dedan.slashNode("fra", 5_000e6, stranger);
         assertEq(dedan.nodeStake(labelId()), 0, "slash is capped at the stake");
         assertEq(usdc.balanceOf(stranger), 11_000e6);
+    }
+
+    function test_suspended_node_and_account_cannot_unbond_or_withdraw() public {
+        registerFra(op1);
+        vm.prank(gov);
+        dedan.suspendNode("fra", true);
+        vm.prank(op1);
+        vm.expectRevert(DedanRegistry.NodeIsSuspended.selector);
+        dedan.requestUnbond("fra");
         vm.prank(gov);
         dedan.suspendNode("fra", false);
-        assertTrue(dedan.isNodeActive("fra"));
+        vm.prank(op1);
+        dedan.requestUnbond("fra");
+        vm.prank(gov);
+        dedan.suspendNode("fra", true); // evidence arrives while it unbonds
+        vm.warp(block.timestamp + 7 days);
+        vm.prank(op1);
+        vm.expectRevert(DedanRegistry.NodeIsSuspended.selector);
+        dedan.withdraw("fra");
+        assertTrue(dedan.nodeSuspended(labelId()));
+        assertEq(dedan.nodeStake(labelId()), 1_000e6, "the stake stays for the slash");
+
+        vm.prank(auditor);
+        dedan.registerAuditor(proof(9), 100e6);
+        vm.prank(gov);
+        dedan.suspendAccount(auditor, true);
+        vm.prank(auditor);
+        vm.expectRevert(DedanRegistry.AccountIsSuspended.selector);
+        dedan.requestUnbondAccount();
+        vm.prank(gov);
+        dedan.suspendAccount(auditor, false);
+        vm.prank(auditor);
+        dedan.requestUnbondAccount();
+        vm.prank(gov);
+        dedan.suspendAccount(auditor, true);
+        vm.warp(block.timestamp + 7 days);
+        vm.prank(auditor);
+        vm.expectRevert(DedanRegistry.AccountIsSuspended.selector);
+        dedan.withdrawAccount();
+        vm.prank(gov);
+        dedan.suspendAccount(auditor, false);
+        vm.prank(auditor);
+        dedan.withdrawAccount();
+        assertEq(dedan.accountStake(auditor), 0);
     }
 
     function test_register_is_closed_and_stake_floor_holds() public {
@@ -297,6 +392,7 @@ contract DedanRegistryTest is Test {
         dedan.registerAuditor(proof(9), 100e6);
         assertTrue(dedan.isAuditor(auditor));
         dedan.requestUnbondAccount();
+        assertFalse(dedan.isAuditor(auditor), "an unbonding auditor runs no probes");
         vm.warp(block.timestamp + 7 days);
         dedan.withdrawAccount();
         vm.stopPrank();
@@ -304,10 +400,16 @@ contract DedanRegistryTest is Test {
         assertEq(usdc.balanceOf(auditor), 10_000e6);
     }
 
-    function test_resolver_operator_role_is_governance_granted() public {
+    function test_resolver_operator_role_is_governance_granted_and_needs_the_bond() public {
         vm.prank(gov);
         dedan.grantRootRoles(DedanRoles.ROLE_RESOLVER_OPERATOR, op2);
+        assertFalse(dedan.isResolverOperator(op2), "no bond yet");
+        vm.prank(op2);
+        dedan.stakeAccount(1_000e6);
         assertTrue(dedan.isResolverOperator(op2));
+        vm.prank(gov);
+        dedan.slashAccount(op2, 1, stranger);
+        assertFalse(dedan.isResolverOperator(op2), "below the minimum bond");
         vm.prank(stranger);
         vm.expectPartialRevert(IEnhancedAccessControl.EACCannotGrantRoles.selector);
         dedan.grantRootRoles(DedanRoles.ROLE_RESOLVER_OPERATOR, stranger);

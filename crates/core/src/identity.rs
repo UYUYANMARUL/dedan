@@ -378,10 +378,13 @@ impl Identity {
             .unwrap_or_default()
     }
 
+    /// The registry's `isNodeActive`: not suspended, not unbonding, and still holding the minimum stake (a
+    /// slash below it takes the node out).
     pub fn node_active(&self, label: &NodeId) -> bool {
+        let min = self.min_stake.get(&STAKE_NODE).copied().unwrap_or(0);
         self.nodes
             .get(label)
-            .is_some_and(|n| !n.suspended && !n.unbonding)
+            .is_some_and(|n| !n.suspended && !n.unbonding && n.stake >= min)
     }
 
     pub fn can_attest(&self, account: Address) -> bool {
@@ -390,16 +393,32 @@ impl Identity {
             .is_some_and(|h| h.attester && !h.suspended)
     }
 
+    /// The registry's `isAuditor`: the role, not suspended, not unbonding (its stake is on its way out), and the
+    /// minimum stake.
     pub fn can_probe(&self, account: Address) -> bool {
         let min = self.min_stake.get(&STAKE_AUDITOR).copied().unwrap_or(0);
         self.humans
             .get(&account)
-            .is_some_and(|h| h.auditor && !h.suspended && h.stake >= min)
+            .is_some_and(|h| h.auditor && !h.suspended && !h.unbonding && h.stake >= min)
     }
 
+    /// Every account that may run assigned probes right now, in address order.
+    pub fn auditors(&self) -> Vec<Address> {
+        self.humans
+            .keys()
+            .copied()
+            .filter(|a| self.can_probe(*a))
+            .collect()
+    }
+
+    /// The registry's `isResolverOperator`: the role, not suspended, and the resolver bond.
     pub fn is_resolver_operator(&self, account: Address) -> bool {
+        let min = self.min_stake.get(&STAKE_RESOLVER).copied().unwrap_or(0);
         self.resolver_operators.contains(&account)
-            && !self.humans.get(&account).is_some_and(|h| h.suspended)
+            && self
+                .humans
+                .get(&account)
+                .map_or(min == 0, |h| !h.suspended && h.stake >= min)
     }
 
     /// Key reveals seen so far, the map's token checker.

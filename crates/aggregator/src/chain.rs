@@ -5,9 +5,12 @@ use alloy::primitives::{Address, Bytes, B256};
 use alloy::providers::{DynProvider, Provider};
 use alloy::rpc::types::Filter;
 use alloy::sol;
+use alloy::sol_types::SolEvent;
 use dedan_core::identity::{Identity, RegistryEvent};
+use dedan_core::settlement::{self, AccountState};
+use dedan_core::types::{AccountId, Tier};
 
-use crate::settle::Roots;
+use crate::settle::{Roots, TierPrice};
 
 pub type Error = Box<dyn std::error::Error + Send + Sync>;
 
@@ -32,7 +35,59 @@ sol! {
         function digest(RootInput r) external view returns (bytes32);
         function publishRoot(RootInput r, bytes[] sigs) external;
         function totalDeposited() external view returns (uint256);
+        event AccountCreated(bytes32 indexed id, address key);
     }
+}
+
+/// Every account the Settlement contract created up to `block`, as it stood at `block`: the balances a
+/// period may bill and the keys its configs must be signed with.
+pub async fn chain_accounts(p: &DynProvider, settlement_addr: Address, block: u64) -> Result<Vec<AccountState>, Error> {
+    let filter = Filter::new()
+        .address(settlement_addr)
+        .event_signature(ISettlement::AccountCreated::SIGNATURE_HASH)
+        .from_block(0)
+        .to_block(block);
+    let mut ids: Vec<B256> = p
+        .get_logs(&filter)
+        .await?
+        .iter()
+        .filter_map(|l| l.log_decode::<ISettlement::AccountCreated>().ok())
+        .map(|d| d.inner.data.id)
+        .collect();
+    ids.sort();
+    ids.dedup();
+    let mut out = Vec::new();
+    for id in ids {
+        let label: Vec<u8> = id.iter().copied().take_while(|b| *b != 0).collect();
+        let id = AccountId::new(String::from_utf8_lossy(&label));
+        out.push(settlement::account(p, settlement_addr, &id, Some(block)).await?);
+    }
+    Ok(out)
+}
+
+/// The on-chain daily price of each distinct tier at `block`.
+pub async fn tier_prices(
+    p: &DynProvider,
+    settlement_addr: Address,
+    version: u32,
+    tiers: impl IntoIterator<Item = Tier>,
+    block: u64,
+) -> Result<Vec<TierPrice>, Error> {
+    let mut out: Vec<TierPrice> = Vec::new();
+    for tier in tiers {
+        if out.iter().any(|x| x.tier == tier) {
+            continue;
+        }
+        let per_day = settlement::price(p, settlement_addr, version, &tier, Some(block)).await?;
+        out.push(TierPrice { tier, per_day });
+    }
+    Ok(out)
+}
+
+/// A published root as the contract holds it: `(inputsHash, payoutRoot, billRoot, voided)`.
+pub async fn root_of(p: &DynProvider, settlement_addr: Address, period: u64) -> Result<(B256, B256, B256, bool), Error> {
+    let r = ISettlement::new(settlement_addr, p.clone()).roots(period).call().await?;
+    Ok((r.inputsHash, r.payoutRoot, r.billRoot, r.voided))
 }
 
 /// Every decoded event of the registry and the cells contract from the first block to `to_block`, in chain

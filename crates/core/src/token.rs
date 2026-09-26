@@ -1,14 +1,16 @@
-//! Fetch tokens (ARCHITECTURE.md §7): `X-Dedan-Node: <label>.<minute>.<hmac>` with
+//! Fetch tokens (ARCHITECTURE.md §7): `X-Dedan-Node: <label>.<minute>.<net>.<hmac>` with
 //! `hmac = HMAC-SHA256(k_hour, "<minute>|<prefix>")` in hex, where the prefix is the client's /24 (IPv4) or
-//! /48 (IPv6). The node reveals `k_hour` on chain after the hour; a token then verifies only against the
-//! network the node actually saw, which ties an "up" result and an attestation to a real fetch from a real
-//! place without putting anyone's full address on a public chain. The nginx mock mints the same string.
+//! /48 (IPv6) as the node saw it and `<net>` is that prefix's network bytes in hex (6 or 12 characters). The
+//! node reveals `k_hour` on chain after the hour; a token then verifies only for the network inside it, which
+//! ties an "up" result and an attestation to a real fetch from a real place without putting anyone's full
+//! address on a public chain. Carrying the network in the token means an auditor behind NAT reports the
+//! prefix the node saw, not the one of its own interface.
 
 use crate::types::{KeyReveal, NodeId};
 use hmac::{Hmac, KeyInit, Mac};
 use sha2::Sha256;
 use std::fmt;
-use std::net::IpAddr;
+use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 use std::str::FromStr;
 
 pub const HEADER: &str = "X-Dedan-Node";
@@ -19,6 +21,8 @@ type HmacSha256 = Hmac<Sha256>;
 pub struct Token {
     pub node_id: NodeId,
     pub minute: u64,
+    /// The client's network as the node saw it, in [`prefix`] form: what the HMAC binds.
+    pub prefix: String,
     pub mac: [u8; 32],
 }
 
@@ -49,6 +53,44 @@ pub fn prefix(ip: IpAddr) -> String {
     }
 }
 
+/// A [`prefix`] string as the token carries it: the network bytes in hex.
+fn net_hex(prefix: &str) -> Option<String> {
+    let (addr, len) = prefix.split_once('/')?;
+    match len {
+        "24" => {
+            let o = addr.parse::<Ipv4Addr>().ok()?.octets();
+            Some(hex::encode(&o[..3]))
+        }
+        "48" => {
+            let s = addr.parse::<Ipv6Addr>().ok()?.segments();
+            Some(format!("{:04x}{:04x}{:04x}", s[0], s[1], s[2]))
+        }
+        _ => None,
+    }
+}
+
+/// The token's network back in [`prefix`] form.
+fn prefix_of_net(net: &str) -> Option<String> {
+    let b = hex::decode(net).ok()?;
+    match b.len() {
+        3 => Some(prefix(IpAddr::V4(Ipv4Addr::new(b[0], b[1], b[2], 0)))),
+        6 => {
+            let seg = |i: usize| u16::from_be_bytes([b[i], b[i + 1]]);
+            Some(prefix(IpAddr::V6(Ipv6Addr::new(
+                seg(0),
+                seg(2),
+                seg(4),
+                0,
+                0,
+                0,
+                0,
+                0,
+            ))))
+        }
+        _ => None,
+    }
+}
+
 pub fn mac(k_hour: &[u8; 32], minute: u64, prefix: &str) -> [u8; 32] {
     let mut m = HmacSha256::new_from_slice(k_hour).expect("HMAC accepts any key length");
     m.update(format!("{minute}|{prefix}").as_bytes());
@@ -62,18 +104,19 @@ pub fn mint(node_id: &NodeId, minute: u64, k_hour: &[u8; 32], prefix: &str) -> T
     Token {
         node_id: node_id.clone(),
         minute,
+        prefix: prefix.to_owned(),
         mac: mac(k_hour, minute, prefix),
     }
 }
 
-/// True when the token was minted by `reveal.node_id` in `reveal.hour` for a client in `prefix`.
-pub fn verify(token: &Token, reveal: &KeyReveal, prefix: &str) -> bool {
+/// True when the token was minted by `reveal.node_id` in `reveal.hour` for a client in the token's network.
+pub fn verify(token: &Token, reveal: &KeyReveal) -> bool {
     if token.node_id != reveal.node_id || token.minute / 60 != reveal.hour {
         return false;
     }
     let mut m =
         HmacSha256::new_from_slice(reveal.k_hour.as_slice()).expect("HMAC accepts any key length");
-    m.update(format!("{}|{}", token.minute, prefix).as_bytes());
+    m.update(format!("{}|{}", token.minute, token.prefix).as_bytes());
     m.verify_slice(&token.mac).is_ok()
 }
 
@@ -81,9 +124,10 @@ impl fmt::Display for Token {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(
             f,
-            "{}.{}.{}",
+            "{}.{}.{}.{}",
             self.node_id,
             self.minute,
+            net_hex(&self.prefix).unwrap_or_default(),
             hex::encode(self.mac)
         )
     }
@@ -99,6 +143,7 @@ impl FromStr for Token {
             .next()
             .and_then(|p| p.parse().ok())
             .ok_or(TokenError)?;
+        let prefix = parts.next().and_then(prefix_of_net).ok_or(TokenError)?;
         let raw = parts
             .next()
             .and_then(|p| hex::decode(p).ok())
@@ -111,6 +156,7 @@ impl FromStr for Token {
         Ok(Token {
             node_id: NodeId::new(label),
             minute,
+            prefix,
             mac,
         })
     }
@@ -145,49 +191,61 @@ mod tests {
         assert_eq!(hex::encode(mac(&key(), 29_000_000, "10.77.0.0/24")), V4);
         assert_eq!(hex::encode(mac(&key(), 29_000_000, "2001:db8::/48")), V6);
         let t = mint(&NodeId::new("istanbul"), 29_000_000, &key(), "10.77.0.0/24");
-        assert_eq!(t.to_string(), format!("istanbul.29000000.{V4}"));
+        assert_eq!(t.to_string(), format!("istanbul.29000000.0a4d00.{V4}"));
     }
 
     #[test]
-    fn verifies_only_with_the_right_key_hour_and_prefix() {
-        let token: Token = format!("istanbul.29000000.{V4}").parse().unwrap();
+    fn the_network_travels_inside_the_token() {
+        let v4 = mint(&NodeId::new("fra"), 7, &key(), "10.77.16.0/24");
+        let back: Token = v4.to_string().parse().unwrap();
+        assert_eq!(back, v4);
+        assert_eq!(back.prefix, "10.77.16.0/24");
+        let v6 = mint(&NodeId::new("fra"), 7, &key(), &prefix("2001:db8:ab::9".parse().unwrap()));
+        let s = v6.to_string();
+        assert!(s.starts_with("fra.7.20010db800ab."), "{s}");
+        assert_eq!(s.parse::<Token>().unwrap().prefix, "2001:db8:ab::/48");
+    }
+
+    #[test]
+    fn verifies_only_with_the_right_key_hour_and_network() {
+        let token: Token = format!("istanbul.29000000.0a4d00.{V4}").parse().unwrap();
         let reveal = KeyReveal {
             node_id: NodeId::new("istanbul"),
             hour: 29_000_000 / 60,
             k_hour: B256::from(key()),
         };
-        assert!(verify(&token, &reveal, "10.77.0.0/24"));
-        assert!(!verify(&token, &reveal, "10.77.1.0/24"));
+        assert!(verify(&token, &reveal));
+        let moved: Token = format!("istanbul.29000000.0a4d01.{V4}").parse().unwrap();
+        assert!(!verify(&moved, &reveal), "another network, the same mac");
         assert!(!verify(
             &token,
             &KeyReveal {
                 hour: reveal.hour + 1,
                 ..reveal.clone()
-            },
-            "10.77.0.0/24"
+            }
         ));
         assert!(!verify(
             &token,
             &KeyReveal {
                 node_id: NodeId::new("tokyo"),
                 ..reveal.clone()
-            },
-            "10.77.0.0/24"
+            }
         ));
         assert!(!verify(
             &token,
             &KeyReveal {
                 k_hour: B256::ZERO,
                 ..reveal
-            },
-            "10.77.0.0/24"
+            }
         ));
     }
 
     #[test]
     fn parse_rejects_garbage() {
         assert!("istanbul.29000000".parse::<Token>().is_err());
-        assert!(".1.00".parse::<Token>().is_err());
-        assert!(format!("istanbul.1.{V4}.extra").parse::<Token>().is_err());
+        assert!(".1.0a4d00.00".parse::<Token>().is_err());
+        assert!(format!("istanbul.1.{V4}").parse::<Token>().is_err(), "the old form has no network");
+        assert!(format!("istanbul.1.0a4d.{V4}").parse::<Token>().is_err());
+        assert!(format!("istanbul.1.0a4d00.{V4}.extra").parse::<Token>().is_err());
     }
 }

@@ -111,6 +111,10 @@ pub struct ScoreInput<'a> {
     pub conforming_resolvers: &'a [ResolverId],
     pub payees: &'a Payees,
     pub prev: &'a Cumulative,
+    /// What each account on chain can still be billed (`settlement::AccountState::effective_balance`). An
+    /// account missing here cannot pay and is billed nothing; every account here gets a bill leaf, so one that
+    /// was never billed can still prove its zero bill and withdraw.
+    pub balances: &'a BTreeMap<AccountId, u128>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -134,6 +138,9 @@ pub struct Multiplier {
     pub list: u128,
     pub bill: u128,
     pub credit: u128,
+    /// The part of the bill the account's balance could not cover: nobody is paid from it.
+    #[serde(default)]
+    pub unfunded: u128,
     pub pool: u128,
     pub paid: u128,
     pub rollover_next: u128,
@@ -155,7 +162,8 @@ pub enum ScoreEvidence {
     OutlierAuditor {
         auditor: AuditorId,
         account: AccountId,
-        node: NodeId,
+        /// The slot member, or `None` for the account's landing probes.
+        node: Option<NodeId>,
         rate: f64,
         others: f64,
     },
@@ -223,12 +231,12 @@ fn median_f(v: &mut [f64]) -> f64 {
     }
 }
 
-/// Failure attribution (§7): connect, TLS and wrong bytes are the node's; a timeout or 5xx is the node's
+/// Failure attribution (§7): connect, TLS and wrong bytes are the node's; a timeout, 4xx or 5xx is the node's
 /// only when another member served the same asset around the same time; DNS failures are nobody's here.
 fn node_failure(x: &ValidProbe, probes: &[&ValidProbe], p: &ScoreParams) -> bool {
     match x.failure {
         Some(FailureClass::Connect | FailureClass::Tls | FailureClass::WrongBytes) => true,
-        Some(FailureClass::Timeout | FailureClass::Http5xx) => probes.iter().any(|y| {
+        Some(FailureClass::Timeout | FailureClass::Http4xx | FailureClass::Http5xx) => probes.iter().any(|y| {
             y.ok && y.account == x.account
                 && y.asset == x.asset
                 && y.served_by.is_some()
@@ -239,18 +247,19 @@ fn node_failure(x: &ValidProbe, probes: &[&ValidProbe], p: &ScoreParams) -> bool
     }
 }
 
-/// Auditors whose failure rate on a target is far above every other auditor's are suspended for the day.
+/// Auditors whose failure rate on a target is far above every other auditor's are suspended for the day. A
+/// target is a slot member (targeted probes) or the account itself (landing probes): a failed landing needs
+/// no token, so without this one auditor inventing a few connect failures could halve a customer's bill.
 fn outliers(
     probes: &[&ValidProbe],
     p: &ScoreParams,
     evidence: &mut Vec<ScoreEvidence>,
 ) -> BTreeSet<AuditorId> {
-    let mut stats: BTreeMap<(AccountId, NodeId), BTreeMap<AuditorId, (usize, usize)>> =
+    let mut stats: BTreeMap<(AccountId, Option<NodeId>), BTreeMap<AuditorId, (usize, usize)>> =
         BTreeMap::new();
     for x in probes {
-        let Some(t) = &x.target else { continue };
         let e = stats
-            .entry((x.account.clone(), t.clone()))
+            .entry((x.account.clone(), x.target.clone()))
             .or_default()
             .entry(x.auditor)
             .or_default();
@@ -373,11 +382,7 @@ pub fn score(inp: &ScoreInput, p: &ScoreParams) -> ScoreOutput {
         .map(|x| !x.ok && node_failure(x, &probes, p))
         .collect();
 
-    let total_list: u128 = inp
-        .accounts
-        .iter()
-        .map(|a| inp.list_price.get(&a.id).copied().unwrap_or(0))
-        .sum();
+    let (mut auditor_pool, mut resolver_pool, mut protocol_share) = (0u128, 0u128, 0u128);
     let mut quality_out = BTreeMap::new();
     let mut multipliers = BTreeMap::new();
     let mut payouts: BTreeMap<Address, u128> = BTreeMap::new();
@@ -468,7 +473,11 @@ pub fn score(inp: &ScoreInput, p: &ScoreParams) -> ScoreOutput {
         } else {
             0.0
         };
-        let delivered = q.values().filter(|x| x.uptime > p.delivered_uptime).count();
+        // a member that served bytes matching no origin digest did not deliver the account, whatever its uptime
+        let delivered = q
+            .values()
+            .filter(|x| x.uptime > p.delivered_uptime && x.integrity > 0.0)
+            .count();
         let s_nodes = if s == 0 {
             0.0
         } else {
@@ -488,12 +497,27 @@ pub fn score(inp: &ScoreInput, p: &ScoreParams) -> ScoreOutput {
         let mult = factor(s_availability)
             .min(factor(s_nodes))
             .min(factor(s_throughput));
-        let bill = mul(list, mult);
-        let credit = list - bill;
+        let bill_full = mul(list, mult);
+        let credit = list - bill_full;
+        // never more than the account can still pay: an over-bill would be paid from other customers' deposits
+        let bill = bill_full.min(inp.balances.get(&a.id).copied().unwrap_or(0));
+        // the part of the list price the bill covers; every pool shrinks with it when the balance runs short
+        let funded_list = list
+            .checked_mul(bill)
+            .and_then(|x| x.checked_div(bill_full))
+            .unwrap_or(0);
 
-        // 6. the node pool and its slots
-        let shares = p.auditor_share + p.resolver_share + p.protocol_share;
-        let pool = mul(list, mult - shares) + inp.prev.rollover.get(&a.id).copied().unwrap_or(0);
+        // 6. the bill splits exactly into the fixed shares and the node pool, so payouts never exceed bills
+        let (to_auditors, to_resolvers, to_protocol) = (
+            mul(funded_list, p.auditor_share),
+            mul(funded_list, p.resolver_share),
+            mul(funded_list, p.protocol_share),
+        );
+        auditor_pool += to_auditors;
+        resolver_pool += to_resolvers;
+        protocol_share += to_protocol;
+        let pool = bill.saturating_sub(to_auditors + to_resolvers + to_protocol)
+            + inp.prev.rollover.get(&a.id).copied().unwrap_or(0);
         let share = if s == 0 { 0 } else { pool / s as u128 };
         let mut paid_total = 0u128;
         for (n, qq) in q.iter_mut() {
@@ -519,6 +543,7 @@ pub fn score(inp: &ScoreInput, p: &ScoreParams) -> ScoreOutput {
                 list,
                 bill,
                 credit,
+                unfunded: bill_full - bill,
                 pool,
                 paid: paid_total,
                 rollover_next,
@@ -530,7 +555,6 @@ pub fn score(inp: &ScoreInput, p: &ScoreParams) -> ScoreOutput {
     }
 
     // 7. auditor pool by valid units: probes plus capped attestations, paid to the auditor's own account
-    let auditor_pool = mul(total_list, p.auditor_share);
     let mut units: BTreeMap<AuditorId, u128> = BTreeMap::new();
     for x in &probes {
         *units.entry(x.auditor).or_default() += 1;
@@ -556,7 +580,6 @@ pub fn score(inp: &ScoreInput, p: &ScoreParams) -> ScoreOutput {
     }
 
     // 8. resolver pool, equal among conforming operators, paid to their accounts
-    let resolver_pool = mul(total_list, p.resolver_share);
     let mut resolver_pay = BTreeMap::new();
     let mut paid_resolvers = 0u128;
     if !inp.conforming_resolvers.is_empty() {
@@ -571,14 +594,17 @@ pub fn score(inp: &ScoreInput, p: &ScoreParams) -> ScoreOutput {
     }
 
     // 9. the protocol fee takes its share plus whatever dust nobody could receive
-    let protocol_fee = mul(total_list, p.protocol_share)
+    let protocol_fee = protocol_share
         + (auditor_pool - paid_auditors)
         + (resolver_pool - paid_resolvers);
     if protocol_fee > 0 {
         *payouts.entry(inp.payees.treasury).or_default() += protocol_fee;
     }
 
-    // 10. cumulative leaves and roots
+    // 10. cumulative leaves and roots; every account on chain has a bill leaf, zero when never billed
+    for id in inp.balances.keys() {
+        cumulative.bill.entry(id.clone()).or_insert(0);
+    }
     for (addr, amount) in &payouts {
         *cumulative.payout.entry(*addr).or_default() += amount;
     }
@@ -770,6 +796,10 @@ mod tests {
     }
 
     fn run(probes: &[ValidProbe], prev: &Cumulative) -> ScoreOutput {
+        run_with(probes, prev, &BTreeMap::from([(AccountId::new("acme"), u128::MAX)]))
+    }
+
+    fn run_with(probes: &[ValidProbe], prev: &Cumulative, balances: &BTreeMap<AccountId, u128>) -> ScoreOutput {
         let acc = account();
         let assignment = Assignment {
             seed: B256::ZERO,
@@ -817,6 +847,7 @@ mod tests {
             conforming_resolvers: &[ResolverId(addr(21))],
             payees: &payees,
             prev,
+            balances,
         };
         score(&inp, &ScoreParams::default())
     }
@@ -839,12 +870,15 @@ mod tests {
 
         let m = &out.multipliers[&acme];
         assert_eq!(m.s_availability, 0.0);
-        assert!((m.s_nodes - 1.0 / 3.0).abs() < 1e-9);
-        assert_eq!(m.bill, 8_333_333);
-        assert_eq!(m.credit, 1_666_667);
-        assert_eq!(m.pool, 6_333_333);
-        assert_eq!(q[&nid("n1")].paid, 2_111_111);
-        assert_eq!(m.rollover_next, 4_222_222);
+        // n2 is down and n3 served wrong bytes: only n1 delivered the account
+        assert!((m.s_nodes - 2.0 / 3.0).abs() < 1e-9);
+        assert_eq!(m.bill, 6_666_666);
+        assert_eq!(m.credit, 3_333_334);
+        assert_eq!(m.unfunded, 0);
+        // 10 % + 5 % + 5 % of the list price come out of the bill first; the rest is the node pool
+        assert_eq!(m.pool, 4_666_666);
+        assert_eq!(q[&nid("n1")].paid, 1_555_555);
+        assert_eq!(m.rollover_next, 3_111_111);
 
         assert_eq!(out.auditor_pay[&aud(11)], 333_333);
         assert!(!out.auditor_pay.contains_key(&aud(14)));
@@ -856,12 +890,12 @@ mod tests {
         assert_eq!(out.resolver_pay[&ResolverId(addr(21))], 500_000);
         assert_eq!(out.payouts[&addr(21)], 500_000);
         assert_eq!(out.protocol_fee, 500_001);
-        assert_eq!(out.payouts[&addr(1)], 2_111_111);
+        assert_eq!(out.payouts[&addr(1)], 1_555_555);
         assert_eq!(
             out.total_cum_payout,
-            2_111_111 + 3 * 333_333 + 500_000 + 500_001
+            1_555_555 + 3 * 333_333 + 500_000 + 500_001
         );
-        assert_eq!(out.total_cum_bill, 8_333_333);
+        assert_eq!(out.total_cum_bill, 6_666_666);
         assert!(out.total_cum_payout <= out.total_cum_bill);
 
         assert!(out.evidence.iter().any(|e| matches!(e, ScoreEvidence::IntegrityMismatch { node, auditors, .. } if *node == nid("n3") && auditors.len() == 3)));
@@ -879,7 +913,7 @@ mod tests {
                 .collect(),
         );
         assert_eq!(tree.root(), out.payout_root);
-        let leaf = merkle::payout_leaf(addr(1), 2_111_111);
+        let leaf = merkle::payout_leaf(addr(1), 1_555_555);
         assert!(merkle::verify(
             &tree.proof(leaf).unwrap(),
             out.payout_root,
@@ -893,11 +927,11 @@ mod tests {
         let second = run(&fixture(), &first.cumulative);
         let acme = AccountId::new("acme");
         // rollover from day one joins day two's pool
-        assert_eq!(second.multipliers[&acme].pool, 6_333_333 + 4_222_222);
-        assert_eq!(second.cumulative.bill[&acme], 2 * 8_333_333);
+        assert_eq!(second.multipliers[&acme].pool, 4_666_666 + 3_111_111);
+        assert_eq!(second.cumulative.bill[&acme], 2 * 6_666_666);
         assert_eq!(
             second.cumulative.payout[&addr(1)],
-            2_111_111 + (6_333_333 + 4_222_222) / 3
+            1_555_555 + (4_666_666 + 3_111_111) / 3
         );
         assert!(second.total_cum_payout <= second.total_cum_bill);
         assert_ne!(second.payout_root, first.payout_root);
@@ -946,6 +980,46 @@ mod tests {
             &[&lone, &late],
             &ScoreParams::default()
         ));
+        // a 4xx for an asset of the customer's list: the same rule
+        lone.failure = Some(FailureClass::Http4xx);
+        assert!(!node_failure(&lone, &[&lone], &ScoreParams::default()));
+        assert!(node_failure(&lone, &[&lone, &served], &ScoreParams::default()));
+    }
+
+    #[test]
+    fn landing_outlier_is_suspended_and_unpaid() {
+        let mut probes = fixture();
+        for i in 0..10 {
+            // every landing fails, but only for auditor 15: a failed landing carries no token to check
+            probes.push(probe(15, ProbeType::Landing, None, None, false, i));
+        }
+        let out = run(&probes, &Cumulative::default());
+        assert!(out.evidence.iter().any(|e| matches!(
+            e,
+            ScoreEvidence::OutlierAuditor { auditor, node: None, .. } if *auditor == aud(15)
+        )));
+        assert!(!out.auditor_pay.contains_key(&aud(15)));
+        assert_eq!(out.multipliers[&AccountId::new("acme")].s_availability, 0.0);
+    }
+
+    #[test]
+    fn bills_stop_at_the_balance_and_every_account_gets_a_leaf() {
+        let balances = BTreeMap::from([
+            (AccountId::new("acme"), 2 * USDC),
+            (AccountId::new("idle"), 0),
+        ]);
+        let out = run_with(&fixture(), &Cumulative::default(), &balances);
+        let m = &out.multipliers[&AccountId::new("acme")];
+        assert_eq!(m.bill, 2 * USDC);
+        assert_eq!(m.unfunded, 6_666_666 - 2 * USDC);
+        // the fixed shares shrink with the funded part (3 of 10 USDC of list price): 0.3 + 0.15 + 0.15
+        assert_eq!(m.pool, 2 * USDC - 600_000);
+        assert!(out.total_cum_payout <= out.total_cum_bill);
+        assert!(out.bill_leaves.contains(&(AccountId::new("idle"), 0)), "a zero leaf to withdraw with");
+        // an account the chain does not know is billed nothing and pays nobody
+        let none = run_with(&fixture(), &Cumulative::default(), &BTreeMap::new());
+        assert_eq!(none.multipliers[&AccountId::new("acme")].bill, 0);
+        assert_eq!(none.total_cum_payout, 0);
     }
 
     #[test]

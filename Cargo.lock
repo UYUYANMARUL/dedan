@@ -2118,7 +2118,6 @@ dependencies = [
  "hex",
  "http",
  "pingora",
- "rand 0.9.5",
  "rcgen",
  "reqwest",
  "rustls",
@@ -3235,6 +3234,7 @@ dependencies = [
  "serde_json",
  "thiserror 2.0.21",
  "tokio",
+ "x509-parser 0.18.1",
 ]
 
 [[package]]
