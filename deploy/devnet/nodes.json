@@ -1,0 +1,10 @@
+{
+  "count": 5,
+  "nodes": [
+    { "label": "frankfurt", "ip": "10.77.16.1", "port": 80, "class": "100M", "location": "50.1109,8.6821", "cell": "599536111567503359", "operator": 2, "hotKey": 12, "attester": 20, "user": "user-frankfurt" },
+    { "label": "tokyo", "ip": "10.77.32.1", "port": 80, "class": "100M", "location": "35.6762,139.6503", "cell": "599811782969655295", "operator": 3, "hotKey": 13, "attester": 21, "user": "user-tokyo" },
+    { "label": "seoul", "ip": "10.77.48.1", "port": 80, "class": "100M", "location": "37.5665,126.978", "cell": "599838696308473855", "operator": 4, "hotKey": 14, "attester": 22, "user": "user-seoul" },
+    { "label": "newyork", "ip": "10.77.64.1", "port": 80, "class": "100M", "location": "40.7128,-74.006", "cell": "599718752904282111", "operator": 5, "hotKey": 15, "attester": 23, "user": "user-newyork" },
+    { "label": "istanbul", "ip": "10.77.80.1", "port": 80, "class": "100M", "location": "41.0082,28.9784", "cell": "599520329710174207", "operator": 6, "hotKey": 16, "attester": 24, "user": "user-istanbul" }
+  ]
+}

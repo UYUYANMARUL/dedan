@@ -1,0 +1,7 @@
+madris-close frankfurt 64 3
+madris-close tokyo 492 20
+madris-close seoul 436 18
+madris-close newyork 234 10
+madris-close istanbul 108 5
+madris-close paris 44 2
+madris-close asd 156 7

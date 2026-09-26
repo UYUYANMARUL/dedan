@@ -1,0 +1,6 @@
+asd frankfurt 208
+asd tokyo 544
+asd seoul 528
+asd newyork 160
+asd istanbul 266
+asd paris 188

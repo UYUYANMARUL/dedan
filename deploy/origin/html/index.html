@@ -1,0 +1,21 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <title>Acme sample origin</title>
+  <link rel="stylesheet" href="/assets/style.css">
+</head>
+<body>
+  <img src="/assets/logo.svg" alt="Acme" width="64" height="64">
+  <h1>Acme sample origin</h1>
+  <p>A customer origin for the Dedan devnet. The asset list a control plane would crawl or read is in
+    <a href="/assets/manifest.txt">/assets/manifest.txt</a>.</p>
+  <p>Images, the kind of asset a CDN exists for (each one is served with the node's <code>X-Dedan-Node</code> token when it comes through Dedan):</p>
+  <p><a href="/images/photo-1.png"><img src="/images/photo-1.png" alt="photo 1" width="160" height="100"></a> <a href="/images/photo-2.png"><img src="/images/photo-2.png" alt="photo 2" width="160" height="100"></a> <a href="/images/photo-3.png"><img src="/images/photo-3.png" alt="photo 3" width="160" height="100"></a> <a href="/images/photo-4.png"><img src="/images/photo-4.png" alt="photo 4" width="160" height="100"></a> <a href="/images/photo-5.png"><img src="/images/photo-5.png" alt="photo 5" width="160" height="100"></a></p>
+  <ul>
+    <li><a href="/assets/blob-2m.bin">blob-2m.bin</a> (2 MB, per-stream throughput probes)</li>
+    <li><a href="/assets/blob-16m.bin">blob-16m.bin</a> (16 MB, per-stream throughput probes)</li>
+  </ul>
+  <script src="/assets/app.js"></script>
+</body>
+</html>

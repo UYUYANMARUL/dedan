@@ -1,0 +1,10 @@
+/assets/style.css
+/assets/app.js
+/assets/logo.svg
+/assets/blob-2m.bin
+/assets/blob-16m.bin
+/images/photo-1.png
+/images/photo-2.png
+/images/photo-3.png
+/images/photo-4.png
+/images/photo-5.png

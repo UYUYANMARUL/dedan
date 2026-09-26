@@ -1,0 +1,7 @@
+.git
+target
+contracts/lib
+contracts/out
+contracts/cache
+contracts/broadcast
+deploy/origin/html/assets/*.bin

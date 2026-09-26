@@ -1,0 +1,3 @@
+[
+  { "label": "acme", "hostnames": ["www.images.com"], "nodes": 6, "class": "100M", "availability": "99.9" }
+]

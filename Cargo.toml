@@ -1,0 +1,12 @@
+[workspace]
+resolver = "2"
+members = ["crates/core", "crates/resolver"]
+
+[workspace.package]
+edition = "2021"
+license = "MIT"
+repository = "https://github.com/dedan-cdn/dedan"
+
+[profile.dev]
+# proptest and hashing are slow unoptimised; the map and assignment tests run many iterations
+opt-level = 1

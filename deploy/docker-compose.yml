@@ -1,0 +1,297 @@
+# Dedan local devnet. `make devnet` from the repo root brings it up; `make smoke` and `make demo` exercise it.
+#
+#   anvil         local chain (chain id 31337), anvil default accounts hold 1,000,000 mock USDC each
+#   deployer      one-shot: installs Solidity deps, deploys Registry + Settlement + mocks, writes contracts/deployments/devnet.json
+#   resolver      the Dedan nameserver (crates/resolver): node records from ENS, steering from the latency map on
+#                 chain, ACME TXT records from its management API, plus the customers' own zones (deploy/resolver/zones)
+#   pebble        ACME CA (stands in for Let's Encrypt), validates DNS-01 against the resolver
+#   origin        sample customer origin with assets and large blobs, located in New York on the simulated WAN
+#   frankfurt, tokyo, seoul, newyork, istanbul
+#                 mock CDN nodes (nginx cache in front of the origin, minting fetch tokens; stand-ins for the Pingora node)
+#   user-<city>   a shell per city on the simulated WAN whose DNS goes to the resolver: attester and end user
+#   dashboard     demo web page on :9090 (nodes from ENS, the map, container logs, add a node at a location)
+#   dozzle        container logs and a browser terminal into any container, on :9999
+#   lego          (profile smoke) ACME client that issues a certificate through the mock DNS, as a node would
+#   kubo          (profile full) IPFS node for the aggregator's published inputs, used from Phase 3 on
+#
+# Simulated WAN: the "wan" network (10.77.0.0/16, one /20 per city) with fixed addresses; every member applies tc netem
+# delays toward every city's /20 from deploy/wan/latency.txt (round trips: Frankfurt-New York 90 ms, Tokyo-Istanbul 280 ms).
+
+name: dedan-devnet
+
+x-foundry: &foundry
+  image: ghcr.io/foundry-rs/foundry:latest
+  entrypoint: ["sh", "-c"]
+
+x-wan: &wan
+  image: dedan-wan:local
+  build: ./wan
+  cap_add:
+    - NET_ADMIN
+
+x-node: &node
+  <<: *wan
+  volumes:
+    - ./wan/node.conf.template:/etc/nginx/templates/default.conf.template:ro
+  depends_on:
+    - origin
+
+x-user: &user
+  <<: *wan
+  command: ["sh", "-c", "/docker-entrypoint.d/05-wan.sh && exec sleep infinity"]
+  dns:
+    - 10.77.0.53 # like an end user's ISP resolver: Docker's embedded DNS forwards to the nameserver
+  depends_on:
+    - resolver
+
+services:
+  anvil:
+    <<: *foundry
+    command: ["anvil --host 0.0.0.0 --port 8545 --chain-id 31337 --block-time 2 --accounts 60"]
+    ports:
+      - "8545:8545"
+    healthcheck:
+      test: ["CMD-SHELL", "cast chain-id --rpc-url http://127.0.0.1:8545"]
+      interval: 2s
+      timeout: 3s
+      retries: 30
+
+  deployer:
+    <<: *foundry
+    command: ["/repo/deploy/scripts/deployer.sh"]
+    working_dir: /repo/contracts
+    volumes:
+      - ..:/repo
+      - foundry-home:/home/foundry # keeps the downloaded solc between runs
+    environment:
+      RPC_URL: http://anvil:8545
+    depends_on:
+      anvil:
+        condition: service_healthy
+
+  resolver:
+    image: dedan-resolver:local
+    build:
+      context: ..
+      dockerfile: crates/resolver/Dockerfile
+    environment:
+      DEDAN_RPC_URL: http://anvil:8545
+      DEDAN_DEPLOYMENT: /deployments/devnet.json
+      DEDAN_ACCOUNTS: /devnet/accounts.json
+      DEDAN_HOSTS: /wan/hosts.txt:/devnet/dynamic-hosts.txt # the second one lists cities added while running
+      DEDAN_ZONES_DIR: /zones
+      DEDAN_MAP_K: "1"
+      RUST_LOG: info
+    volumes:
+      - ../contracts/deployments:/deployments:ro
+      - ./devnet:/devnet:ro
+      - ./resolver/zones:/zones:ro
+      - ./wan/hosts.txt:/wan/hosts.txt:ro
+    networks:
+      default: {}
+      wan:
+        ipv4_address: 10.77.0.53 # outside every city's /20 on purpose: anycast, no simulated delay
+    ports:
+      - "15353:53/udp" # 5353 is macOS mDNS; dig -p 15353 @127.0.0.1 acme.dedan-cdn.test +subnet=10.77.32.30/24
+      - "15353:53/tcp"
+      - "8055:8055" # management API: /nodes, /map, /assignment, /set-txt, /clear-txt
+    healthcheck:
+      test: ["CMD", "curl", "-sf", "http://127.0.0.1:8055/health"]
+      interval: 2s
+      timeout: 3s
+      retries: 30
+    depends_on:
+      anvil:
+        condition: service_healthy
+
+  pebble:
+    image: ghcr.io/letsencrypt/pebble:latest
+    command: ["-config", "/pebble/config.json", "-dnsserver", "resolver:53"]
+    environment:
+      PEBBLE_VA_NOSLEEP: "1"
+    volumes:
+      - ./pebble/config.json:/pebble/config.json:ro
+      - pebble-certs:/test/certs
+    ports:
+      - "14000:14000"
+      - "15000:15000"
+    depends_on:
+      - resolver
+
+  origin:
+    <<: *wan
+    environment:
+      CITY: newyork
+    volumes:
+      - ./origin/html:/usr/share/nginx/html
+      - ./origin/10-blobs.sh:/docker-entrypoint.d/10-blobs.sh:ro
+    networks:
+      default: {}
+      wan:
+        ipv4_address: 10.77.64.20
+    ports:
+      - "8080:80"
+
+  frankfurt:
+    <<: *node
+    environment:
+      CITY: frankfurt
+      NODE_ID: frankfurt
+      DEDAN_TOKEN_KEY: "0101010101010101010101010101010101010101010101010101010101010101"
+    networks:
+      wan:
+        ipv4_address: 10.77.16.1
+    ports:
+      - "8011:80"
+
+  tokyo:
+    <<: *node
+    environment:
+      CITY: tokyo
+      NODE_ID: tokyo
+      DEDAN_TOKEN_KEY: "0101010101010101010101010101010101010101010101010101010101010101"
+    networks:
+      wan:
+        ipv4_address: 10.77.32.1
+    ports:
+      - "8012:80"
+
+  seoul:
+    <<: *node
+    environment:
+      CITY: seoul
+      NODE_ID: seoul
+      DEDAN_TOKEN_KEY: "0101010101010101010101010101010101010101010101010101010101010101"
+    networks:
+      wan:
+        ipv4_address: 10.77.48.1
+    ports:
+      - "8013:80"
+
+  newyork:
+    <<: *node
+    environment:
+      CITY: newyork
+      NODE_ID: newyork
+      DEDAN_TOKEN_KEY: "0101010101010101010101010101010101010101010101010101010101010101"
+    networks:
+      wan:
+        ipv4_address: 10.77.64.1
+    ports:
+      - "8014:80"
+
+  istanbul:
+    <<: *node
+    environment:
+      CITY: istanbul
+      NODE_ID: istanbul
+      DEDAN_TOKEN_KEY: "0101010101010101010101010101010101010101010101010101010101010101"
+    networks:
+      wan:
+        ipv4_address: 10.77.80.1
+    ports:
+      - "8015:80"
+
+  user-frankfurt:
+    <<: *user
+    environment:
+      CITY: frankfurt
+    networks:
+      wan:
+        ipv4_address: 10.77.16.30
+
+  user-tokyo:
+    <<: *user
+    environment:
+      CITY: tokyo
+    networks:
+      wan:
+        ipv4_address: 10.77.32.30
+
+  user-seoul:
+    <<: *user
+    environment:
+      CITY: seoul
+    networks:
+      wan:
+        ipv4_address: 10.77.48.30
+
+  user-newyork:
+    <<: *user
+    environment:
+      CITY: newyork
+    networks:
+      wan:
+        ipv4_address: 10.77.64.30
+
+  user-istanbul:
+    <<: *user
+    environment:
+      CITY: istanbul
+    networks:
+      wan:
+        ipv4_address: 10.77.80.30
+
+  lego:
+    image: goacme/lego:latest
+    profiles: ["smoke"]
+    entrypoint: ["sh", "-c"]
+    command: ["/lego-scripts/issue.sh"]
+    environment:
+      EXEC_PATH: /lego-scripts/set-txt.sh
+      EXEC_PROPAGATION_TIMEOUT: "60"
+      EXEC_POLLING_INTERVAL: "2"
+      EXEC_SEQUENCE_INTERVAL: "2"
+      LEGO_CA_CERTIFICATES: /pebble-certs/pebble.minica.pem
+    volumes:
+      - ./lego:/lego-scripts:ro
+      - pebble-certs:/pebble-certs:ro
+      - lego-data:/lego-data
+    depends_on:
+      - pebble
+      - resolver
+
+  kubo:
+    image: ipfs/kubo:latest
+    profiles: ["full"]
+    ports:
+      - "5001:5001"
+      - "8081:8080"
+
+  dashboard:
+    build: ./dashboard
+    image: dedan-dashboard:local
+    working_dir: ${PWD} # the repo at its host path, so compose bind mounts made from inside resolve on the host
+    environment:
+      NS_API: http://resolver:8055
+      DOZZLE_URL: http://localhost:9999
+    volumes:
+      - ${PWD}:${PWD}
+      - /var/run/docker.sock:/var/run/docker.sock
+    ports:
+      - "9090:9090"
+    depends_on:
+      - resolver
+
+  dozzle:
+    image: amir20/dozzle:latest
+    environment:
+      DOZZLE_ENABLE_SHELL: "true" # a terminal into any container from the browser (demo only: no auth)
+      DOZZLE_FILTER: name=dedan-devnet
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock
+    ports:
+      - "9999:8080"
+
+networks:
+  default: {}
+  wan:
+    ipam:
+      config:
+        - subnet: 10.77.0.0/16
+
+volumes:
+  pebble-certs:
+  lego-data:
+  foundry-home:
+    name: dedan-foundry-home # shared with the Makefile's docker-run targets

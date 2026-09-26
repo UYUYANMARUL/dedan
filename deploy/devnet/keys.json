@@ -1,0 +1,4 @@
+{
+  "_comment": "The devnet's static hourly token key for the mock nodes (deploy/wan/dedan.js); each node's hot key reveals it on chain for the current hour so tokens verify. Gone once the Pingora node mints real per-hour keys.",
+  "k_hour": "0101010101010101010101010101010101010101010101010101010101010101"
+}

@@ -1,0 +1,29 @@
+# Mock CDN node: an nginx cache in front of the origin, minting Dedan fetch tokens (deploy/wan/dedan.js).
+# Stand-in for the Pingora node until it exists.
+js_import dedan from /etc/nginx/dedan.js;
+js_set $dedan_token dedan.token;
+
+proxy_cache_path /var/cache/nginx/edge levels=1:2 keys_zone=edge:10m max_size=512m inactive=1h use_temp_path=off;
+
+server {
+    listen 80;
+    set $dedan_label "${NODE_ID}";
+    set $dedan_key "${DEDAN_TOKEN_KEY}";
+    add_header X-Dedan-Node $dedan_token always;
+    add_header X-Cache $upstream_cache_status always;
+
+    # the class probe blob and the endpoint challenge the real node serves (ARCHITECTURE.md §5)
+    location /.well-known/dedan/blob/ {
+        alias /usr/share/nginx/blob/;
+    }
+
+    location / {
+        proxy_pass http://origin;
+        proxy_set_header Host $host;
+        proxy_cache edge;
+        proxy_cache_key $host$request_uri;
+        proxy_cache_valid 200 301 302 10m;
+        proxy_cache_lock on;
+        proxy_cache_use_stale error timeout updating http_500 http_502 http_503 http_504;
+    }
+}

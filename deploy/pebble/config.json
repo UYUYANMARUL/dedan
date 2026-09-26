@@ -1,0 +1,27 @@
+{
+  "pebble": {
+    "listenAddress": "0.0.0.0:14000",
+    "managementListenAddress": "0.0.0.0:15000",
+    "certificate": "test/certs/localhost/cert.pem",
+    "privateKey": "test/certs/localhost/key.pem",
+    "httpPort": 5002,
+    "tlsPort": 5001,
+    "ocspResponderURL": "",
+    "externalAccountBindingRequired": false,
+    "domainBlocklist": ["blocked-domain.example"],
+    "retryAfter": {
+      "authz": 3,
+      "order": 5
+    },
+    "profiles": {
+      "default": {
+        "description": "90-day certificate, like the classic Let's Encrypt profile",
+        "validityPeriod": 7776000
+      },
+      "shortlived": {
+        "description": "160-hour certificate, like Let's Encrypt's shortlived profile",
+        "validityPeriod": 576000
+      }
+    }
+  }
+}

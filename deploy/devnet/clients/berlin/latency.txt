@@ -1,0 +1,7 @@
+berlin frankfurt 26 2
+berlin tokyo 434 18
+berlin seoul 296 12
+berlin newyork 286 12
+berlin istanbul 82 4
+berlin paris 52 3
+berlin asd 242 10

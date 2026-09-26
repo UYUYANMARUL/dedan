@@ -1,0 +1,7 @@
+; images.com as the customer's DNS provider serves it. These two records are the whole Dedan onboarding on the
+; customer's side (ARCHITECTURE.md section 3): the site itself, and the ACME challenge delegation for managed TLS.
+; An apex name cannot be a CNAME: use a subdomain such as www, or the provider's ALIAS record.
+$ORIGIN images.com.
+$TTL 300
+www                  IN CNAME acme.dedan-cdn.test.
+_acme-challenge.www  IN CNAME _acme-challenge.acme.dedan-cdn.test.

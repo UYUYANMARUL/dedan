@@ -1,0 +1,7 @@
+madrid frankfurt 54 3
+madrid tokyo 434 18
+madrid seoul 446 18
+madrid newyork 206 9
+madrid istanbul 116 5
+madrid paris 44 2
+madrid asd 162 7

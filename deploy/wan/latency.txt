@@ -1,0 +1,11 @@
+# Round-trip time in ms between cities (symmetric; typical public-internet figures). Same city = 2 ms.
+frankfurt  newyork   90
+frankfurt  tokyo     240
+frankfurt  seoul     250
+frankfurt  istanbul  45
+newyork    tokyo     175
+newyork    seoul     185
+newyork    istanbul  135
+tokyo      seoul     35
+tokyo      istanbul  280
+seoul      istanbul  290

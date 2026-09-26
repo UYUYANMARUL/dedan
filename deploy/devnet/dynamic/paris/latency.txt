@@ -1,0 +1,5 @@
+paris frankfurt 28
+paris tokyo 398
+paris seoul 368
+paris newyork 242
+paris istanbul 100

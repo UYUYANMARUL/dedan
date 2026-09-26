@@ -1,0 +1,7 @@
+contracts/lib/
+contracts/out/
+contracts/cache/
+contracts/broadcast/
+contracts/deployments/
+deploy/origin/html/assets/*.bin
+target/

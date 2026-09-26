@@ -1,0 +1,11 @@
+{
+  "permissions": {
+    "allow": [
+      "WebSearch",
+      "WebFetch(domain:developers.circle.com)",
+      "WebFetch(domain:github.com)",
+      "WebFetch(domain:www.theblock.co)",
+      "WebFetch(domain:www.maxmind.com)"
+    ]
+  }
+}
