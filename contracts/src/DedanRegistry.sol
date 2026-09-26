@@ -12,13 +12,14 @@ import {NameCoder} from "@ens/contracts/utils/NameCoder.sol";
 import {DedanResolver} from "./DedanResolver.sol";
 import {DedanRoles} from "./DedanRoles.sol";
 import {IWorldIDVerifier} from "./IWorldIDVerifier.sol";
+import {LibCell} from "./LibCell.sol";
 
 /// @title Dedan's identity layer: the `dedan.eth` subname registry (ENSv2) with Dedan's own rules.
 /// @notice Nodes are subname tokens; their endpoint and config are ENS records the owner writes on the
 ///         resolver; every permission is an Enhanced Access Control role on this contract. Verified humans
 ///         (World ID) get the roles that let them register nodes, attest round trips or run assigned probes.
-///         Attestations and key reveals are events of this contract, so the latency map is a pure function
-///         of the chain.
+///         Cells (the regions of the latency map, `DedanCells`) are names here too, with this registry as their
+///         subregistry, so every node name also resolves under every cell: `<label>.<cell>.dedan.eth`.
 /// @dev Roles and the reason for the per-human resource are in `DedanRoles`. Stakes are USDC.
 contract DedanRegistry is PermissionedRegistry {
     using SafeERC20 for IERC20;
@@ -38,16 +39,6 @@ contract DedanRegistry is PermissionedRegistry {
         uint256[5] proof;
     }
 
-    /// @dev One round trip measured by a verified human from an H3 cell (ARCHITECTURE.md §7).
-    struct Attestation {
-        uint64 cell;
-        bytes32 labelHash;
-        uint32 rttMs;
-        uint32 hitTtfbMs;
-        bytes token;
-        bytes prefix;
-    }
-
     uint64 public constant UNBONDING_PERIOD = 7 days;
     uint256 public constant ACTION_OPERATOR = uint256(keccak256("dedan-operator")) >> 8;
     uint256 public constant ACTION_ATTESTER = uint256(keccak256("dedan-attester")) >> 8;
@@ -59,6 +50,8 @@ contract DedanRegistry is PermissionedRegistry {
     IWorldIDVerifier public worldId;
     uint64 public worldIdRpId;
     DedanResolver public dedanResolver;
+    /// @notice The cells contract: registers cell names here and resolves them.
+    address public cells;
 
     mapping(uint256 action => mapping(uint256 nullifier => bool used)) public nullifierUsed;
     mapping(StakeKind kind => uint256 amount) public minStake;
@@ -81,19 +74,10 @@ contract DedanRegistry is PermissionedRegistry {
     event AccountSuspended(address indexed account, bool suspended);
     event AccountSlashed(address indexed account, uint256 amount, address to);
     event KeyRevealed(bytes32 indexed labelHash, uint64 indexed hour, bytes32 kHour);
-    event Attested(
-        address indexed attester,
-        uint64 indexed cell,
-        bytes32 indexed labelHash,
-        uint32 rttMs,
-        uint32 hitTtfbMs,
-        bytes token,
-        bytes prefix,
-        uint64 ts
-    );
     event MinStakeSet(StakeKind kind, uint256 amount);
     event WorldIdSet(address verifier, uint64 rpId);
     event ResolverSet(address resolver);
+    event CellsSet(address cells);
 
     error UseRegisterNode();
     error NotNodeOwner();
@@ -103,6 +87,8 @@ contract DedanRegistry is PermissionedRegistry {
     error WrongStatus();
     error AccountIsSuspended();
     error ZeroAddress();
+    error NotCells();
+    error CellLabel();
 
     constructor(
         ILabelStore labelStore,
@@ -124,6 +110,14 @@ contract DedanRegistry is PermissionedRegistry {
         if (address(resolver) == address(0)) revert ZeroAddress();
         dedanResolver = resolver;
         emit ResolverSet(address(resolver));
+    }
+
+    /// @notice The cells contract, also told to the node resolver so `<label>.<cell>` alias names resolve.
+    function setCells(address cells_) external onlyRootRoles(DedanRoles.ROLE_CONFIGURE) {
+        if (cells_ == address(0)) revert ZeroAddress();
+        cells = cells_;
+        dedanResolver.setCells(cells_);
+        emit CellsSet(cells_);
     }
 
     function setMinStake(StakeKind kind, uint256 amount) external onlyRootRoles(DedanRoles.ROLE_CONFIGURE) {
@@ -223,6 +217,7 @@ contract DedanRegistry is PermissionedRegistry {
         _requireHuman(DedanRoles.ROLE_NODE_OPERATOR);
         if (stake < minStake[StakeKind.Node]) revert StakeTooLow();
         if (address(dedanResolver) == address(0)) revert ZeroAddress();
+        if (LibCell.isCellLabel(label)) revert CellLabel();
         uint256 labelId = LibLabel.id(label);
         tokenId = _register(
             label,
@@ -274,17 +269,20 @@ contract DedanRegistry is PermissionedRegistry {
         emit KeyRevealed(bytes32(labelId), hour, kHour);
     }
 
-    // ---- attestations -------------------------------------------------------------------------
+    // ---- cells --------------------------------------------------------------------------------
 
-    /// @notice A verified attester records round trips from its cell. Nothing is stored; the events are the
-    ///         published inputs of the latency map. `ts` is the block time, so nothing can be backdated.
-    function attest(Attestation[] calldata batch) external {
-        _requireHuman(DedanRoles.ROLE_ATTESTER);
-        uint64 ts = uint64(block.timestamp);
-        for (uint256 i; i < batch.length; ++i) {
-            Attestation calldata a = batch[i];
-            emit Attested(msg.sender, a.cell, a.labelHash, a.rttMs, a.hitTtfbMs, a.token, a.prefix, ts);
-        }
+    /// @notice The cells contract registers a cell's name on its first member: owned and resolved by the cells
+    ///         contract, with this registry as the subregistry so every node name resolves under the cell too.
+    function registerCell(uint64 cell) external returns (bytes32 node) {
+        if (msg.sender != cells) revert NotCells();
+        string memory label = LibCell.label(cell);
+        _register(label, cells, IRegistry(address(this)), cells, 0, type(uint64).max, false);
+        return nodeOf(label);
+    }
+
+    /// @notice namehash of `<cell>.<parent>`.
+    function cellNode(uint64 cell) external view returns (bytes32) {
+        return nodeOf(LibCell.label(cell));
     }
 
     // ---- views --------------------------------------------------------------------------------

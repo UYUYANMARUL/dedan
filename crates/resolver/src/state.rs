@@ -1,20 +1,20 @@
 //! Configuration, the shared snapshot and the sync loop that rebuilds it from the chain.
 
 use std::collections::{BTreeMap, HashMap};
-use std::net::{IpAddr, Ipv4Addr, SocketAddr};
+use std::net::{Ipv4Addr, SocketAddr};
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use alloy::primitives::{keccak256, Address};
+use alloy::primitives::Address;
 use alloy::providers::{Provider, RootProvider};
-use dedan_core::assign::{assign, AccountInfo, AssignParams, Assignment, NodeInfo, Yesterday};
+use dedan_core::assign::{assign, AccountInfo, AssignParams, Assignment, Yesterday};
+use dedan_core::config::{self, AccountCfg, Deployment, Geo};
 use dedan_core::ens::{EnsClient, NodeRecord};
 use dedan_core::identity::Identity;
-use dedan_core::map::{self, GeoLocate, Map, MapParams};
-use dedan_core::token;
+use dedan_core::map::{self, Map, MapParams, Validator};
+use dedan_core::schedule;
 use dedan_core::types::*;
-use serde::Deserialize;
 use tokio::sync::RwLock;
 use tracing::info;
 
@@ -49,11 +49,7 @@ impl Config {
                 .to_lowercase(),
             parent: get("DEDAN_PARENT", "dedan.eth"),
             accounts: get("DEDAN_ACCOUNTS", "/devnet/accounts.json").into(),
-            hosts: get("DEDAN_HOSTS", "/wan/hosts.txt")
-                .split(':')
-                .filter(|p| !p.is_empty())
-                .map(PathBuf::from)
-                .collect(),
+            hosts: config::paths(&get("DEDAN_HOSTS", "/wan/hosts.txt")),
             zones_dir: get("DEDAN_ZONES_DIR", "/zones").into(),
             dns_addr: get("DEDAN_DNS_ADDR", "0.0.0.0:53").parse()?,
             http_addr: get("DEDAN_HTTP_ADDR", "0.0.0.0:8055").parse()?,
@@ -66,68 +62,6 @@ impl Config {
     /// The zone with its trailing dot, lowercase.
     pub fn zone_dot(&self) -> String {
         format!("{}.", self.zone)
-    }
-}
-
-#[derive(Debug, Deserialize)]
-struct Deployment {
-    #[serde(rename = "dedanRegistry")]
-    dedan_registry: Address,
-    #[serde(rename = "universalResolver")]
-    universal_resolver: Address,
-}
-
-#[derive(Debug, Deserialize)]
-struct AccountCfg {
-    label: String,
-    /// Informational on the devnet: the customer's own zone files carry the CNAMEs.
-    #[allow(dead_code)]
-    hostnames: Vec<String>,
-    nodes: u8,
-    class: Class,
-    availability: Availability,
-}
-
-/// Where a client network is, from the devnet's host table (GeoIP in production).
-#[derive(Debug, Default)]
-pub struct Geo {
-    by_prefix: HashMap<String, LatLon>,
-}
-
-impl Geo {
-    /// `name city ip role lat lon` rows; the prefix of each ip maps to its coordinates.
-    pub fn from_hosts(text: &str) -> Self {
-        let mut by_prefix = HashMap::new();
-        for line in text.lines() {
-            let f: Vec<&str> = line.split_whitespace().collect();
-            if f.len() < 6 || f[0].starts_with('#') {
-                continue;
-            }
-            if let (Ok(ip), Ok(lat), Ok(lon)) = (f[2].parse::<IpAddr>(), f[4].parse(), f[5].parse())
-            {
-                by_prefix.insert(token::prefix(ip), LatLon::new(lat, lon));
-            }
-        }
-        Self { by_prefix }
-    }
-
-    pub fn from_files(paths: &[PathBuf]) -> Self {
-        let text: String = paths
-            .iter()
-            .filter_map(|p| std::fs::read_to_string(p).ok())
-            .collect::<Vec<_>>()
-            .join("\n");
-        Self::from_hosts(&text)
-    }
-
-    pub fn len(&self) -> usize {
-        self.by_prefix.len()
-    }
-}
-
-impl GeoLocate for Geo {
-    fn locate(&self, prefix: &str) -> Option<LatLon> {
-        self.by_prefix.get(prefix).copied()
     }
 }
 
@@ -159,6 +93,7 @@ pub struct State {
 struct Chain {
     ens: EnsClient<RootProvider>,
     registry: Address,
+    cells: Address,
     universal_resolver: Address,
 }
 
@@ -171,19 +106,9 @@ pub fn unix_now() -> u64 {
 
 impl State {
     pub async fn new(cfg: Config) -> Result<Self, Error> {
-        let accounts_cfg: Vec<AccountCfg> =
-            serde_json::from_str(&std::fs::read_to_string(&cfg.accounts)?)?;
-        let accounts: Vec<AccountInfo> = accounts_cfg
+        let accounts: Vec<AccountInfo> = AccountCfg::load_all(&cfg.accounts)?
             .iter()
-            .map(|a| AccountInfo {
-                id: AccountId::new(&a.label),
-                nodes: a.nodes,
-                class: a.class,
-                availability: a.availability,
-                min_node_stake: 0,
-                operator_allowlist: vec![],
-                operator_denylist: vec![],
-            })
+            .map(AccountCfg::info)
             .collect();
         let geo = Geo::from_files(&cfg.hosts);
         let provider = RootProvider::new_http(cfg.rpc_url.parse()?);
@@ -206,10 +131,12 @@ impl State {
     /// The contracts to sync from, and whether they differ from the previous refresh's (then the identity cache
     /// is stale and the replay starts over).
     async fn chain(&self) -> Result<(Arc<Chain>, bool), Error> {
-        let dep: Deployment =
-            serde_json::from_str(&std::fs::read_to_string(&self.cfg.deployment)?)?;
+        let dep = Deployment::load(&self.cfg.deployment)?;
         if let Some(c) = self.chain.read().await.as_ref() {
-            if c.registry == dep.dedan_registry && c.universal_resolver == dep.universal_resolver {
+            if c.registry == dep.dedan_registry
+                && c.cells == dep.dedan_cells
+                && c.universal_resolver == dep.universal_resolver
+            {
                 return Ok((c.clone(), false));
             }
         }
@@ -220,9 +147,10 @@ impl State {
                 self.cfg.parent.clone(),
             ),
             registry: dep.dedan_registry,
+            cells: dep.dedan_cells,
             universal_resolver: dep.universal_resolver,
         });
-        info!(registry = %dep.dedan_registry, universal_resolver = %dep.universal_resolver, "deployment loaded");
+        info!(registry = %dep.dedan_registry, cells = %dep.dedan_cells, universal_resolver = %dep.universal_resolver, "deployment loaded");
         *self.chain.write().await = Some(chain.clone());
         Ok((chain, true))
     }
@@ -242,12 +170,9 @@ impl State {
             identity = Identity::default();
         }
         let applied = identity
-            .replay(&self.provider, chain.registry, head)
+            .replay(&self.provider, &[chain.registry, chain.cells], head)
             .await?;
-        let mut records = BTreeMap::new();
-        for label in identity.nodes.keys() {
-            records.insert(label.clone(), chain.ens.node_record(label).await?);
-        }
+        let records = chain.ens.node_records(identity.nodes.keys()).await?;
         let now = unix_now();
         let params = MapParams {
             k_min: self.cfg.map_k,
@@ -255,32 +180,19 @@ impl State {
         };
         let labels = identity.labels_by_hash();
         let geo = Geo::from_files(&self.cfg.hosts);
-        let (map, map_evidence) = Map::from_chain(
+        // the contract's map, mirrored from its events on the chain's clock; the token and location checks
+        // the contract cannot make, as evidence
+        let map = Map::from_votes(
             &identity.attested,
-            identity.reveals(),
+            &identity.members,
             &labels,
-            &geo,
-            now,
+            identity.block_time,
             &params,
         );
+        let (_, map_evidence) = Validator::new(params.clone(), identity.reveals(), &geo)
+            .validate_events(&identity.attested, &labels);
         *self.geo.write().expect("geo lock") = geo;
-        let nodes: Vec<NodeInfo> = identity
-            .nodes
-            .values()
-            .filter_map(|n| {
-                let r = records.get(&n.label)?;
-                Some(NodeInfo {
-                    id: n.label.clone(),
-                    active: identity.node_active(&n.label),
-                    entry_passed: true,
-                    class: r.class.unwrap_or(Class::M100),
-                    stake: n.stake,
-                    ip: IpAddr::V4(r.ipv4?),
-                    asn: None,
-                    owner: n.owner,
-                })
-            })
-            .collect();
+        let nodes = config::node_infos(&identity, &records);
         // yesterday's members count as fully served until the scoring loop exists
         let quality: HashMap<(AccountId, NodeId), f64> = prev
             .sets
@@ -291,7 +203,7 @@ impl State {
             assignment: &prev,
             quality: &quality,
         };
-        let seed = keccak256((now / 86_400).to_be_bytes());
+        let seed = schedule::seed_of(now);
         let assignment = assign(
             seed,
             &nodes,

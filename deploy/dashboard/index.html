@@ -3,7 +3,12 @@
 <head>
 <meta charset="utf-8">
 <title>Dedan devnet</title>
+<link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/leaflet/1.9.4/leaflet.min.css">
 <style>
+#worldmap { height: 480px; border-radius: 8px; background: #0d1117; }
+.leaflet-tile { filter: brightness(0.7) invert(1) hue-rotate(190deg) saturate(0.4) contrast(0.9); }
+.leaflet-container { font: inherit; }
+.leaflet-tooltip { background: #161b22; color: #e6edf3; border-color: #30363d; }
   :root { --bg:#0f1115; --panel:#171a21; --line:#2a2f3a; --fg:#d7dae0; --dim:#8b93a3; --ok:#3fb950; --warn:#d29922; --bad:#f85149; --link:#58a6ff; }
   body { margin:0; background:var(--bg); color:var(--fg); font:14px/1.45 -apple-system, Segoe UI, Helvetica, Arial, sans-serif; }
   header { padding:14px 20px; border-bottom:1px solid var(--line); display:flex; gap:18px; align-items:baseline; flex-wrap:wrap; }
@@ -26,7 +31,7 @@
 <body>
 <header>
   <h1>Dedan devnet</h1>
-  <span class="dim">nodes are <code>&lt;label&gt;.dedan.eth</code> names; steering comes from attestations on chain</span>
+  <span class="dim">nodes are <code>&lt;label&gt;.dedan.eth</code> names, cells <code>&lt;cell&gt;.dedan.eth</code> regions; steering comes from the medians on chain</span>
   <span class="grow"></span>
   <a id="dozzle" href="#" target="_blank">logs &amp; terminals (Dozzle)</a>
   <a href="/api/state" target="_blank">api</a>
@@ -38,6 +43,16 @@
     <table><thead><tr><th>name</th><th>ipv4</th><th>location</th><th>class</th><th class="num">stake</th><th>state</th><th>slot set</th><th>closest for</th><th>logs</th><th>terminal</th></tr></thead>
     <tbody id="nodes"></tbody></table>
     <div id="logpanes"></div>
+  </section>
+  <section>
+    <h2>World map: cells and the nodes that joined them</h2>
+    <p class="dim">Each hexagon is a resolution-2 cell some node joined, coloured by its best median (green fast, red slow, blue no votes yet). Click a cell for its name, members and on-chain medians; click a node for the cells it joined.</p>
+    <div id="worldmap"></div>
+    <div id="celldetail" class="dim" style="margin-top:8px">click a cell for its details, a node for the cells it joined</div>
+  </section>
+  <section>
+    <h2>Cells (resolution-2 regions as ENS names; nodes join them, humans attest their members)</h2>
+    <table><thead><tr><th>cell name</th><th>centre</th><th>members</th><th>votes</th><th>medians on chain (ms)</th></tr></thead><tbody id="cells"></tbody></table>
   </section>
   <section>
     <h2>Latency map (median round trip per cell, ms)</h2>
@@ -81,8 +96,14 @@
       <span>nodes to measure:</span><span id="targets"></span>
       <button id="attest">2. measure from the client and submit</button>
     </div>
-    <p class="dim">The client's user container pings each node and fetches a token from it; the batch goes to <code>DedanRegistry.attest</code> signed by the human's key. Without <code>ROLE_ATTESTER</code> (an unverified key) the contract rejects it. Accepted rows move the map above within about 12 s. Same thing from a terminal:</p>
+    <p class="dim">The client's user container pings the nodes that joined its cell and fetches a token from each; the batch goes to <code>DedanCells.attest(cell, batch)</code> signed by the human's key: one vote per node, its newest sample, at most one batch per minute per cell. Without <code>ROLE_ATTESTER</code> (an unverified key) the contract rejects it. Accepted votes move the medians above within about 12 s. Same thing from a terminal:</p>
     <pre class="cmd" id="attestcurl" style="max-height:none"></pre>
+  </section>
+  <section>
+    <h2>Settlement (the aggregator's periods, countersigned and published on chain)</h2>
+    <p class="dim">Every period the aggregator writes the inputs and outputs to its data volume, the countersigner recomputes them, and <code>publishRoot</code> goes on chain with two signatures. <code>make demo-settlement</code> starts the loop with the city auditors; the report is <code>dedan-aggregator report /data/periods/&lt;n&gt;</code>.</p>
+    <table><thead><tr><th>period</th><th>window</th><th>registry block</th><th>cumulative payout</th><th>cumulative bill</th><th>on chain</th><th>report</th></tr></thead><tbody id="periods"></tbody></table>
+    <pre id="report" class="cmd" style="max-height:none;display:none"></pre>
   </section>
   <section>
     <h2>Jobs</h2>
@@ -93,8 +114,60 @@
     <table><thead><tr><th>container</th><th>status</th><th>logs</th><th>terminal</th></tr></thead><tbody id="containers"></tbody></table>
   </section>
 </main>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/leaflet/1.9.4/leaflet.min.js"></script>
 <script>
 const $ = s => document.querySelector(s);
+let worldmap = null, cellLayer = null, nodeLayer = null, selectedCell = null, selectedNode = null;
+function ensureMap() {
+  if (worldmap || !window.L) return;
+  worldmap = L.map('worldmap', { worldCopyJump: true, zoomControl: true }).setView([30, 20], 2);
+  const pre = new URLSearchParams(location.hash.replace(/^#/, ''));
+  if (pre.get('cell')) selectedCell = pre.get('cell');
+  if (pre.get('node')) selectedNode = pre.get('node');
+  L.tileLayer('https://tile.openstreetmap.org/{z}/{x}/{y}.png', { maxZoom: 12, attribution: '&copy; OpenStreetMap contributors' }).addTo(worldmap);
+  cellLayer = L.layerGroup().addTo(worldmap);
+  nodeLayer = L.layerGroup().addTo(worldmap);
+}
+function cellColor(best) { return best === null ? '#4c7bd9' : best <= 30 ? '#3fb950' : best <= 120 ? '#d29922' : '#f85149'; }
+function renderMap() {
+  ensureMap(); if (!worldmap) return;
+  const cells = (state.cells && state.cells.cells) || [];
+  const nodes = (state.nodes && state.nodes.nodes) || [];
+  cellLayer.clearLayers(); nodeLayer.clearLayers();
+  for (const c of cells) {
+    if (!c.boundary || !c.boundary.length) continue;
+    const best = c.nodes && c.nodes.length ? c.nodes[0].median_ms : null;
+    const mine = selectedNode && c.members.includes(selectedNode);
+    const chosen = c.cell === selectedCell || mine;
+    const poly = L.polygon(c.boundary, { color: chosen ? '#ffffff' : cellColor(best), weight: chosen ? 3 : 1, fillColor: cellColor(best), fillOpacity: best === null ? 0.15 : 0.4 });
+    poly.bindTooltip(`${c.name}: ${c.members.join(', ')}${best !== null ? ` · ${c.nodes[0].label} ${best} ms` : ' · no votes yet'}`);
+    poly.on('click', () => { selectedCell = c.cell; selectedNode = null; location.hash = `cell=${c.cell}`; renderMap(); });
+    poly.addTo(cellLayer);
+  }
+  for (const n of nodes) {
+    if (!n.location) continue;
+    const m = L.circleMarker([n.location.lat, n.location.lon], { radius: 7, color: '#ffffff', weight: 1, fillColor: selectedNode === n.label ? '#ff7b72' : '#58a6ff', fillOpacity: 0.95 });
+    m.bindTooltip(`${n.name} (${n.ipv4 || '?'})`);
+    m.on('click', () => { selectedNode = n.label; selectedCell = null; location.hash = `node=${n.label}`; renderMap(); });
+    m.addTo(nodeLayer);
+  }
+  const el = $('#celldetail');
+  if (selectedNode) {
+    const mine = cells.filter(c => c.members.includes(selectedNode));
+    el.innerHTML = `<b><code>${esc(selectedNode)}.dedan.eth</code></b> joined ${mine.length} cell${mine.length === 1 ? '' : 's'}: ` + (mine.map(c => { const r = (c.nodes || []).find(x => x.label === selectedNode);
+      return `<code>${esc(selectedNode)}.${esc(c.name)}</code>${r ? ` <span class="ok">${r.median_ms} ms</span>` : ' <span class="dim">no votes</span>'}`; }).join(', ') || '<span class="dim">none</span>');
+    return;
+  }
+  const c = cells.find(x => x.cell === selectedCell);
+  if (!c) { el.innerHTML = '<span class="dim">click a cell for its details, a node for the cells it joined</span>'; return; }
+  const who = v => `<code>${esc(v.attester.slice(0, 6))}…${esc(v.attester.slice(-4))}</code> ${v.rtt_ms} ms <span class="dim">${new Date(v.ts * 1000).toLocaleTimeString()}</span>`;
+  el.innerHTML = `<b><code>${esc(c.name)}</code></b> <span class="dim">centre ${c.centre.lat.toFixed(2)}, ${c.centre.lon.toFixed(2)} · ${c.humans} vote${c.humans === 1 ? '' : 's'} · ${c.members.length} member${c.members.length === 1 ? '' : 's'}</span>
+    <table style="margin-top:6px"><thead><tr><th>member</th><th>its name in this cell</th><th>median on chain (dedan.latency)</th><th>the votes behind it: human (World ID-verified key), newest sample, when</th></tr></thead><tbody>
+    ${c.members.map(m => { const r = (c.nodes || []).find(x => x.label === m);
+      return `<tr><td>${esc(m)}</td><td><code>${esc(m)}.${esc(c.name)}</code></td><td>${r ? `<span class="ok">${r.median_ms} ms</span> <span class="dim">of ${r.voters.length} vote${r.voters.length === 1 ? '' : 's'}</span>` : '<span class="dim">no votes yet</span>'}</td>
+        <td>${r && r.voters.length ? r.voters.map(who).join('<br>') : '<span class="dim">—</span>'}</td></tr>`; }).join('')}
+    </tbody></table>`;
+}
 const esc = s => String(s ?? '').replace(/[&<>"]/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c]));
 let state = {};
 const openLogs = new Set();
@@ -136,6 +209,10 @@ function containerFor(name) { return (state.containers || []).find(c => c.name =
 function logLink(name) { return `<button onclick="toggleLogs('${name}')">${openLogs.has(name) ? 'hide' : 'tail'}</button>`; }
 function termLink(name) { const c = containerFor(name); return c ? `<a href="${state.dozzle}/container/${c.id.slice(0, 12)}" target="_blank">open</a>` : '<span class="dim">—</span>'; }
 async function toggleLogs(name) { openLogs.has(name) ? openLogs.delete(name) : openLogs.add(name); render(); await loadLogs(); }
+async function showReport(n) {
+  const pre = $('#report'); pre.style.display = 'block'; pre.textContent = `loading the report of period ${n}…`;
+  try { pre.textContent = await (await fetch(`/api/settlement/${n}`)).text(); } catch (e) { pre.textContent = `report error: ${e}`; }
+}
 async function loadLogs() {
   for (const name of openLogs) {
     const el = document.getElementById(`log-${name}`); if (!el) continue;
@@ -160,6 +237,11 @@ function render() {
     <td>${logLink(n.label)}</td><td>${termLink(n.label)}</td></tr>`).join('') || '<tr><td colspan="10" class="dim">no nodes yet (the nameserver syncs every 10 s)</td></tr>';
   $('#logpanes').innerHTML = [...openLogs].map(n => `<div><b>${esc(n)}</b> <span class="dim">docker logs --tail 120 dedan-devnet-${esc(n)}-1</span><pre id="log-${esc(n)}"></pre></div>`).join('');
   const cellCity = {}; for (const c of (state.cities || [])) cellCity[c.cell] = c.city;
+  const cellList = (state.cells && state.cells.cells) || [];
+  $('#cells').innerHTML = cellList.map(c => `<tr><td class="nowrap"><code>${esc(c.name)}</code>${cellCity[c.cell] ? ` <span class="dim">${esc(cellCity[c.cell])}</span>` : ''}</td>
+    <td class="nowrap">${c.centre ? `${c.centre.lat.toFixed(2)}, ${c.centre.lon.toFixed(2)}` : ''}</td><td>${(c.members || []).map(esc).join(', ')}</td><td class="num">${c.humans}</td>
+    <td>${(c.nodes || []).map((n, i) => `<span class="${i === 0 ? 'ok' : ''}">${esc(n.label)} ${n.median_ms}</span>`).join(' · ') || '<span class="dim">no votes yet</span>'}</td></tr>`).join('')
+    || '<tr><td colspan="5" class="dim">no node has joined a cell yet</td></tr>';
   $('#map').innerHTML = ranks.filter(r => r.rings === 0).map(r => `<tr><td class="nowrap"><code>${r.cell}</code></td><td>${esc(cellCity[r.cell] || '')}</td><td class="num">${r.humans}</td>
     <td>${r.nodes.map(([n, ms], i) => `<span class="${i === 0 ? 'ok' : ''}">${esc(n)} ${ms}</span>`).join(' · ')}</td></tr>`).join('')
     || '<tr><td colspan="4" class="dim">no attestations yet (run make demo, or add a node)</td></tr>';
@@ -175,19 +257,35 @@ function render() {
   }
   citySel.onchange = setAttestCurl;
   const tg = $('#targets');
-  if (tg.querySelectorAll('input').length !== nodes.length)
-    tg.innerHTML = nodes.map(n => `<label><input type="checkbox" value="${esc(n.label)}" checked> ${esc(n.label)}</label> `).join('');
+  const selCity = cityList.find(c => c.city === citySel.value);
+  const myCell = cellList.find(c => selCity && c.cell === selCity.cell);
+  const targets = myCell ? myCell.members : [];
+  if (tg.dataset.key !== targets.join(',')) {
+    tg.dataset.key = targets.join(',');
+    tg.innerHTML = targets.map(l => `<label><input type="checkbox" value="${esc(l)}" checked> ${esc(l)}</label> `).join('')
+      || '<span class="dim">no node has joined this client\'s cell: nothing to attest</span>';
+  }
   for (const [id, j] of Object.entries(state.jobs || {})) if (j.kind === 'worldid' && j.status === 'done') { const m = j.log.match(/verified: (0x[0-9a-fA-F]+)/); if (m) verified[j.label] = m[1]; }
   const v = verified[citySel.value], sel = cityList.find(c => c.city === citySel.value);
   $('#human').innerHTML = v ? `<span class="ok">verified human ${esc(v.slice(0, 10))}… holds ROLE_ATTESTER</span>`
     : sel && sel.verified_at_start ? '<span class="ok">verified at devnet start (holds ROLE_ATTESTER)</span>' : '<span class="warn">not verified: the contract will reject its metrics until step 1</span>';
   setAttestCurl();
+  const st = state.settlement;
+  const usdc = x => (Number(x) / 1e6).toFixed(6);
+  const hms = t => new Date(t * 1000).toLocaleTimeString();
+  $('#periods').innerHTML = !st ? '<tr><td colspan="7" class="dim">the settlement loop is not running (make demo-settlement)</td></tr>'
+    : !st.periods.length ? `<tr><td colspan="7" class="dim">no period closed yet (every ${st.period_secs} s)</td></tr>`
+    : st.periods.slice().reverse().map(p => `<tr><td class="num">${p.period}</td><td class="nowrap">${hms(p.start)} – ${hms(p.end)}</td><td class="num">${p.registry_block}</td>
+      <td class="num">${usdc(p.total_cum_payout)} USDC</td><td class="num">${usdc(p.total_cum_bill)} USDC</td>
+      <td>${p.published ? `<span class="ok">published</span> <code>${esc(String(p.tx).slice(0, 12))}…</code>` : '<span class="warn">not published</span>'}</td>
+      <td><button onclick="showReport(${p.period})">report</button></td></tr>`).join('');
   const openJobs = new Set([...document.querySelectorAll('#jobs details[open]')].map(d => d.dataset.id));
   const entries = Object.entries(state.jobs || {}).reverse();
   $('#jobs').innerHTML = entries.map(([id, j], i) => `<details data-id="${id}" ${j.status === 'running' || (i === 0 && !entries.some(([, x]) => x.status === 'running')) || openJobs.has(id) ? 'open' : ''}>
     <summary><b>${esc(j.kind)}</b> ${esc(j.label)} <span class="${j.status === 'done' ? 'ok' : j.status === 'failed' ? 'bad' : 'warn'}">${j.status}</span> <span class="dim">job ${id}</span></summary><pre>${esc(j.log)}</pre></details>`).join('') || '<span class="dim">nothing run yet</span>';
   $('#containers').innerHTML = (state.containers || []).map(c => { const short = c.name.replace(/^dedan-devnet-/, '').replace(/-1$/, '');
     return `<tr><td><code>${esc(c.name)}</code></td><td class="${/^Up/.test(c.status) ? 'ok' : 'warn'}">${esc(c.status)}</td><td>${logLink(short)}</td><td>${termLink(short)}</td></tr>`; }).join('');
+  renderMap();
   $('#updated').textContent = `updated ${new Date().toLocaleTimeString()}`;
 }
 async function refresh() {

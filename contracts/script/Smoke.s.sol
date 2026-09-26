@@ -6,6 +6,7 @@ import {MessageHashUtils} from "@openzeppelin/contracts/utils/cryptography/Messa
 import {UniversalResolverV2} from "@ensdomains/contracts-v2/universalResolver/UniversalResolverV2.sol";
 import {ITextResolver} from "@ens/contracts/resolvers/profiles/ITextResolver.sol";
 import {NameCoder} from "@ens/contracts/utils/NameCoder.sol";
+import {DedanCells} from "../src/DedanCells.sol";
 import {DedanRegistry} from "../src/DedanRegistry.sol";
 import {DedanResolver} from "../src/DedanResolver.sol";
 import {LibDnsWire} from "../src/LibDnsWire.sol";
@@ -27,8 +28,11 @@ contract Smoke is Script {
     MockUSDC usdc;
     DedanRegistry dedan;
     DedanResolver resolver;
+    DedanCells cells;
     UniversalResolverV2 ur;
     Settlement settlement;
+    /// the resolution-2 cell of Istanbul, where the smoke node says it is
+    uint64 constant IST_CELL = 586010010790658047;
 
     uint256 govPk;
     uint256 customerPk;
@@ -44,6 +48,7 @@ contract Smoke is Script {
         usdc = MockUSDC(vm.parseJsonAddress(json, ".usdc"));
         dedan = DedanRegistry(vm.parseJsonAddress(json, ".dedanRegistry"));
         resolver = DedanResolver(vm.parseJsonAddress(json, ".dedanResolver"));
+        cells = DedanCells(vm.parseJsonAddress(json, ".dedanCells"));
         ur = UniversalResolverV2(vm.parseJsonAddress(json, ".universalResolver"));
         settlement = Settlement(vm.parseJsonAddress(json, ".settlement"));
         govPk = vm.deriveKey(MNEMONIC, 0);
@@ -88,21 +93,23 @@ contract Smoke is Script {
         dedan.registerOperator(_proof(70));
         uint256 tokenId = dedan.registerNode("smoke", signers, 1_000e6);
         resolver.multicall(calls);
+        uint64[] memory myCells = new uint64[](1);
+        myCells[0] = IST_CELL;
+        cells.join("smoke", myCells);
         vm.stopBroadcast();
 
         // a verified attester and a staked auditor
         vm.startBroadcast(attesterPk);
         dedan.registerAttester(_proof(250));
-        DedanRegistry.Attestation[] memory batch = new DedanRegistry.Attestation[](1);
-        batch[0] = DedanRegistry.Attestation({
-            cell: 0x851fb467fffffff,
+        DedanCells.Sample[] memory batch = new DedanCells.Sample[](1);
+        batch[0] = DedanCells.Sample({
             labelHash: keccak256("smoke"),
             rttMs: 12,
             hitTtfbMs: 20,
             token: "smoke.29000000.00",
             prefix: "10.77.0.0/24"
         });
-        dedan.attest(batch);
+        cells.attest(IST_CELL, batch);
         vm.stopBroadcast();
         vm.startBroadcast(auditorPk);
         usdc.approve(address(dedan), 100e6);
@@ -119,6 +126,10 @@ contract Smoke is Script {
         require(found == address(resolver), "universal resolver found another resolver");
         require(keccak256(bytes(abi.decode(res, (string)))) == keccak256("100M"), "dedan.class record");
         require(resolver.dnsRecord(node, keccak256(name), 1).length > 0, "A record missing");
+        // the node inside its cell: `smoke.<cell>.dedan.eth` carries the cell's median for it (one vote so far)
+        bytes memory aliasName = NameCoder.encode("smoke.821ecffffffffff.dedan.eth");
+        (res,) = ur.resolve(aliasName, abi.encodeCall(ITextResolver.text, (NameCoder.namehash(aliasName, 0), "dedan.latency")));
+        require(keccak256(bytes(abi.decode(res, (string)))) == keccak256("12"), "dedan.latency record of the alias");
 
         // the operator changes the node's IP: one DNS record write, the path every operator uses
         vm.startBroadcast(opPk);
@@ -159,7 +170,7 @@ contract Smoke is Script {
             "stage 1: smoke.dedan.eth registered (token %s), records resolve through the Universal Resolver", tokenId
         );
         console2.log(
-            "stage 1: attester and auditor verified; key revealed; attestation recorded; IP record changed by the operator"
+            "stage 1: attester and auditor verified; key revealed; smoke joined its cell and one vote sets its median (12 ms) on smoke.821ecffffffffff.dedan.eth; IP record changed by the operator"
         );
         console2.log("stage 1: period 1 roots published with 2 signatures (node 80, treasury 20, acme billed 100)");
     }

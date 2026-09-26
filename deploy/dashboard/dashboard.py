@@ -18,6 +18,7 @@ import uuid
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 NS_API = os.environ.get("NS_API", "http://127.0.0.1:8055")
+AGG_API = os.environ.get("AGG_API", "http://aggregator:8060")  # the settlement loop, when its compose profile is up
 DOZZLE = os.environ.get("DOZZLE_URL", "http://localhost:9999")
 ROOT = os.path.dirname(os.path.abspath(__file__))
 jobs = {}  # id -> {label, status, log}
@@ -26,6 +27,22 @@ jobs = {}  # id -> {label, status, log}
 def ns(path):
     with urllib.request.urlopen(NS_API + path, timeout=5) as r:
         return json.load(r)
+
+
+def settlement():
+    """The aggregator's published periods, or None while the settlement profile is down."""
+    try:
+        with urllib.request.urlopen(AGG_API + "/periods", timeout=3) as r:
+            return json.load(r)
+    except Exception:
+        return None
+
+
+def settlement_report(period):
+    """`dedan-aggregator report` for one period, run inside the aggregator container (the data volume lives there)."""
+    out = subprocess.run(["docker", "compose", "--progress", "quiet", "-f", "deploy/docker-compose.yml", "--profile", "settlement", "exec", "-T",
+                          "aggregator", "dedan-aggregator", "report", f"/data/periods/{int(period)}"], capture_output=True, text=True)
+    return out.stdout + out.stderr
 
 
 def containers():
@@ -83,8 +100,8 @@ class Handler(BaseHTTPRequestHandler):
             with open(os.path.join(ROOT, "index.html"), "rb") as f:
                 return self.reply(200, f.read(), "text/html; charset=utf-8")
         if u.path == "/api/state":
-            state = {"dozzle": DOZZLE, "containers": containers(), "jobs": jobs, "cities": humans()}
-            for k in ("nodes", "map", "assignment"):
+            state = {"dozzle": DOZZLE, "containers": containers(), "jobs": jobs, "cities": humans(), "settlement": settlement()}
+            for k in ("nodes", "map", "assignment", "cells"):
                 try:
                     state[k] = ns("/" + k)
                 except Exception as e:  # the nameserver may still be syncing
@@ -95,6 +112,8 @@ class Handler(BaseHTTPRequestHandler):
             for e in state["map"].get("rejected", []):
                 e["cell"] = str(e.get("cell", ""))
             return self.reply(200, state)
+        if u.path.startswith("/api/settlement/"):
+            return self.reply(200, settlement_report(u.path.rsplit("/", 1)[1]), "text/plain; charset=utf-8")
         if u.path.startswith("/api/logs/"):
             name = u.path.rsplit("/", 1)[1]
             out = subprocess.run(["docker", "logs", "--tail", q.get("tail", ["200"])[0], name], capture_output=True, text=True)

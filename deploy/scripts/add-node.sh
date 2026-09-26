@@ -20,9 +20,9 @@ n=$(( 6 + $(grep -c ' node ' "$DYNAMIC_HOSTS" || true) ))
 k=$((n - 6)); node_ip="10.77.$((16 * n)).1"; user_ip="10.77.$((16 * n)).30"
 operator=$((30 + 3 * k)); hot=$((31 + 3 * k)); attester=$((32 + 3 * k))
 dir=deploy/devnet/dynamic/$label; mkdir -p "$dir"
-cell=$(curl -sf "$NS_API/cell?lat=$lat&lon=$lon" | python3 -c "import json,sys; print(json.load(sys.stdin)['cell'])")
+cell=$(cell_of "$lat" "$lon"); cells=$(cell_of "$lat" "$lon" 1)   # the node joins its own cell and the ring around it
 
-echo "== $label: node $node_ip, user $user_ip, keys $operator/$hot/$attester, cell $cell"
+echo "== $label: node $node_ip, user $user_ip, keys $operator/$hot/$attester, cell $cell (joins 7 cells)"
 # WAN tables for the two new containers. Existing containers were set up without a band for this /20, so they
 # send toward it undelayed; the new containers carry the whole round trip on their side instead (wan.sh applies
 # half of the table entry, hence 2x). Round trip: 5 ms + 20 ms per 1000 km great-circle.
@@ -42,10 +42,10 @@ docker run -d --name "dedan-devnet-user-$label-1" --label "dedan.dynamic=$label"
 tail -n 2 "$dir/hosts.txt" >> "$DYNAMIC_HOSTS"   # the nameserver's geo table picks these up on its next sync
 echo "containers dedan-devnet-$label-1 and dedan-devnet-user-$label-1 started"
 
-echo "== registering $label.dedan.eth on chain (operator, name, records, hot key, attester)"
+echo "== registering $label.dedan.eth on chain (operator, name, records, hot key, attester) and joining its cells"
 cat > "$dir/node.json" <<JSON
 { "count": 1, "nodes": [ { "label": "$label", "ip": "$node_ip", "port": 80, "class": "100M", "location": "$lat,$lon", "cell": "$cell",
-  "operator": $operator, "hotKey": $hot, "attester": $attester, "user": "user-$label" } ] }
+  "operator": $operator, "hotKey": $hot, "attester": $attester, "user": "user-$label", "cells": $cells } ] }
 JSON
 cp "$dir/node.json" "contracts/deployments/nodes-$label.json"
 $COMPOSE run --rm -T -e NODES_JSON="deployments/nodes-$label.json" deployer \
@@ -57,13 +57,12 @@ curl -sf "$NS_API/nodes" | grep -q "\"$label.dedan.eth\"" || { echo "the nameser
 echo "$label.dedan.eth resolved by the nameserver: $(curl -sf "$NS_API/nodes" | python3 -c "
 import json,sys; n=[x for x in json.load(sys.stdin)['nodes'] if x['label']=='$label'][0]; print('ipv4', n['ipv4'], 'owner', n['owner'][:10], 'active', n['active'])")"
 
-echo "== every city's human attests round trips to every node (full batches, so the map ranks every node in every cell)"
-# ponytail: each run adds one attestation per (human, node); the map caps them at 3 per epoch and lists the rest as over_cap
-for n in $(cities); do reveal_key "$n"; done   # every node, since every city attests every node
-for c in $(cities); do attest_from "$c" $(cities); done
+echo "== every human attests the members of its own cell (one vote per node; the new node's cell now has a member)"
+for n in $(cities); do reveal_key "$n"; done   # tokens verify only against revealed keys (auditor pay and evidence)
+for h in $(users); do attest_from "$h" || true; done
 sleep 12
 echo "== done. Try it:"
 echo "  docker exec dedan-devnet-user-$label-1 dig +short www.images.com"
 echo "  docker exec dedan-devnet-user-$label-1 curl -s -D - -o /dev/null http://www.images.com/images/photo-1.png"
-echo "  curl -s $NS_API/map | python3 -m json.tool | grep -A 8 $cell"
+echo "  curl -s $NS_API/cells | python3 -m json.tool | grep -B 3 -A 12 '\"$cell\"'"
 echo "  make routing-check"

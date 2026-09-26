@@ -9,6 +9,7 @@ repository.workspace = true
 [dependencies]
 alloy = { version = "2.5", features = ["provider-http", "rpc-types", "sol-types", "signer-local", "contract"] }
 alloy-ens = "2.5"
+alloy-signer-local = { version = "2.5", features = ["mnemonic"] }
 h3o = "0.11"
 hex = "0.4"
 hmac = "0.13"

@@ -10,6 +10,7 @@ import {IContractNamer} from "@ensdomains/contracts-v2/reverse-registrar/interfa
 import {UniversalResolverV2} from "@ensdomains/contracts-v2/universalResolver/UniversalResolverV2.sol";
 import {LabelStore} from "@ensdomains/contracts-v2/utils/LabelStore.sol";
 import {IGatewayProvider} from "@ens/contracts/ccipRead/IGatewayProvider.sol";
+import {DedanCells} from "../src/DedanCells.sol";
 import {DedanRegistry} from "../src/DedanRegistry.sol";
 import {DedanResolver} from "../src/DedanResolver.sol";
 import {IWorldIDVerifier} from "../src/IWorldIDVerifier.sol";
@@ -19,7 +20,7 @@ import {MockUSDC} from "../src/mocks/MockUSDC.sol";
 import {MockWorldID} from "../src/mocks/MockWorldID.sol";
 
 /// Devnet deployment: mock USDC and World ID, the ENSv2 tree (root → eth → dedan, the last one being Dedan's own
-/// registry), the node resolver, the Universal Resolver, Settlement, minimum stakes, signer set, price table and
+/// registry), the node resolver, the cells contract, the Universal Resolver, Settlement, minimum stakes, signer set, price table and
 /// funded actors. Anvil runs with 60 accounts (30+ for cities added at runtime): 0 governance, 1 customer, 2-6 city node operators, 7 smoke operator,
 /// 8 aggregator, 9 countersigner, 12-16 city hot keys, 17 smoke hot key, 20-24 city attesters, 25 smoke attester,
 /// 26 smoke auditor.
@@ -36,6 +37,7 @@ contract Deploy is Script {
     PermissionedRegistry eth;
     DedanRegistry dedan;
     DedanResolver resolver;
+    DedanCells cells;
     UniversalResolverV2 ur;
     Settlement settlement;
 
@@ -59,6 +61,7 @@ contract Deploy is Script {
         console2.log("rootRegistry      ", address(root));
         console2.log("dedanRegistry     ", address(dedan));
         console2.log("dedanResolver     ", address(resolver));
+        console2.log("dedanCells        ", address(cells));
         console2.log("universalResolver ", address(ur));
         console2.log("settlement        ", address(settlement));
         console2.log("addresses written to contracts/deployments/devnet.json");
@@ -70,8 +73,10 @@ contract Deploy is Script {
         root = new PermissionedRegistry(labelStore, gov, TLD_GOV_ROLES);
         eth = new PermissionedRegistry(labelStore, gov, TLD_GOV_ROLES);
         dedan = new DedanRegistry(labelStore, gov, usdc, IWorldIDVerifier(address(worldId)), 1, "dedan.eth");
-        resolver = new DedanResolver(IPermissionedRegistry(address(dedan)));
+        resolver = new DedanResolver(IPermissionedRegistry(address(dedan)), "dedan.eth");
         dedan.setDedanResolver(resolver);
+        cells = new DedanCells(dedan);
+        dedan.setCells(address(cells));
         root.register("eth", gov, IRegistry(address(eth)), address(0), LABEL_OWNER_ROLES, type(uint64).max);
         eth.setParent(IRegistry(address(root)), "eth");
         eth.register("dedan", gov, IRegistry(address(dedan)), address(0), LABEL_OWNER_ROLES, type(uint64).max);
@@ -105,6 +110,7 @@ contract Deploy is Script {
         vm.serializeAddress(j, "ethRegistry", address(eth));
         vm.serializeAddress(j, "dedanRegistry", address(dedan));
         vm.serializeAddress(j, "dedanResolver", address(resolver));
+        vm.serializeAddress(j, "dedanCells", address(cells));
         vm.serializeAddress(j, "universalResolver", address(ur));
         vm.serializeAddress(j, "governance", gov);
         vm.serializeAddress(j, "aggregator", aggregator);

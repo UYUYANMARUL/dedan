@@ -1,3 +1,7 @@
 [
-  { "label": "acme", "hostnames": ["www.images.com"], "nodes": 6, "class": "100M", "availability": "99.9" }
+  {
+    "label": "acme", "hostnames": ["www.images.com"], "nodes": 6, "class": "100M", "availability": "99.9",
+    "origin": "http://origin", "asset_list": "/assets/manifest.txt",
+    "price_usdc_per_day": 7200
+  }
 ]

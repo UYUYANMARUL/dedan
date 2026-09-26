@@ -1,9 +1,13 @@
 //! The latency map (ARCHITECTURE.md §6, §7): where the humans measure each node to be.
 //!
-//! Attestations are `Attested` events of the Dedan registry, one per round trip a verified human measured
-//! from its H3 cell. A [`Validator`] applies the rules of §7 to them in chain order; the surviving rows
-//! build a [`Map`] that is a pure function of those events, so every resolver, the aggregator, the
-//! countersigner and `recompute` hold the same map from the same chain.
+//! Attestations are `Attested` events of the cells contract, one per round trip a verified human measured
+//! to a member of its H3 cell. The contract keeps the map itself: per human, cell and node the newest
+//! sample is the vote, votes land in the day's histogram, and a cell's record for a node is the median over
+//! today's and yesterday's votes. [`Map::from_votes`] mirrors exactly those rules from the events, so every
+//! resolver, the aggregator, the countersigner and `recompute` hold the contract's map without asking it.
+//! The [`Validator`] applies the checks the contract cannot (the fetch token, the network's location) for
+//! auditor pay and governance evidence; [`Map::build`] over its rows is the same map computed from raw
+//! samples, used by tests and the anchor rules.
 
 use crate::geo;
 use crate::token::{self, Token};
@@ -23,9 +27,11 @@ pub struct MapParams {
     pub epoch_s: u64,
     /// The client prefix inside the token must geolocate within this distance of the attested cell.
     pub geo_radius_km: f64,
-    pub per_node_cap: usize,
     pub pay_cap: usize,
     pub anchor_clamp_ms: u32,
+    /// The contract's histogram: `buckets` buckets of `bucket_ms` each, the last one open-ended.
+    pub bucket_ms: u32,
+    pub buckets: usize,
 }
 
 impl MapParams {
@@ -36,9 +42,10 @@ impl MapParams {
             window_s: 48 * 3600,
             epoch_s: 24 * 3600,
             geo_radius_km: 250.0,
-            per_node_cap: 3,
             pay_cap: 50,
             anchor_clamp_ms: 50,
+            bucket_ms: 8,
+            buckets: 32,
         }
     }
 
@@ -89,9 +96,10 @@ pub enum Rejection {
     BadToken,
     UnknownLocation,
     OutOfArea { km: f64 },
-    CellChanged { epoch_cell: Cell },
-    OverCap,
 }
+
+/// The nodes that joined each cell.
+pub type Membership = BTreeMap<Cell, BTreeSet<NodeId>>;
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Evidence {
@@ -160,14 +168,13 @@ impl TokenCheck for RevealSet {
     }
 }
 
-/// Applies the validity rules of §7 to attestations in chain order: the first valid attestation of an epoch
-/// fixes the human's cell for that epoch.
+/// The checks the contract cannot make (§7): the fetch token against the key the node revealed, and the
+/// network inside the token within `geo_radius_km` of the attested cell. Everything else (membership, the
+/// batch cadence, one vote per human per node per cell) the contract enforced before the event existed.
 pub struct Validator<'a> {
     params: MapParams,
     tokens: &'a dyn TokenCheck,
     geo: &'a dyn GeoLocate,
-    epoch_cell: HashMap<(AuditorId, u64), Cell>,
-    counts: HashMap<(AuditorId, u64, NodeId), usize>,
 }
 
 impl<'a> Validator<'a> {
@@ -176,8 +183,6 @@ impl<'a> Validator<'a> {
             params,
             tokens,
             geo,
-            epoch_cell: HashMap::new(),
-            counts: HashMap::new(),
         }
     }
 
@@ -187,7 +192,6 @@ impl<'a> Validator<'a> {
         auditor: AuditorId,
         a: &Attestation,
     ) -> Result<ValidAttestation, Evidence> {
-        let epoch = self.params.epoch_of(a.ts);
         let reject = |reason: Rejection| Evidence {
             auditor,
             node: Some(a.node_id.clone()),
@@ -205,18 +209,6 @@ impl<'a> Validator<'a> {
         if km > self.params.geo_radius_km {
             return Err(reject(Rejection::OutOfArea { km }));
         }
-        let epoch_cell = *self.epoch_cell.entry((auditor, epoch)).or_insert(a.cell);
-        if epoch_cell != a.cell {
-            return Err(reject(Rejection::CellChanged { epoch_cell }));
-        }
-        let n = self
-            .counts
-            .entry((auditor, epoch, a.node_id.clone()))
-            .or_default();
-        if *n >= self.params.per_node_cap {
-            return Err(reject(Rejection::OverCap));
-        }
-        *n += 1;
         Ok(ValidAttestation {
             auditor,
             cell: a.cell,
@@ -316,10 +308,20 @@ pub struct AnchorDisagreement {
     pub auditors: Vec<AuditorId>,
 }
 
+/// One human's current vote for a node in a cell: its newest sample inside the window.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Voter {
+    pub attester: Address,
+    pub rtt_ms: u32,
+    pub ts: u64,
+}
+
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 pub struct Map {
     /// Every cell within `rings` of a measured cell that reached `k_min` humans, directly or by ring search.
     pub ranks: BTreeMap<Cell, CellRank>,
+    /// The votes behind each cell's medians (`from_votes` only): who, how many ms, when; by rtt.
+    pub voters: BTreeMap<Cell, BTreeMap<NodeId, Vec<Voter>>>,
     /// Cells covered without ring search: what the assignment optimises over.
     pub covered: BTreeSet<Cell>,
     pub nodes_seen: BTreeSet<NodeId>,
@@ -369,18 +371,146 @@ impl Map {
         map
     }
 
-    /// Straight from the chain: `Attested` and `KeyRevealed` events, the registry's label table, a locator.
-    pub fn from_chain(
+    /// The contract's map, mirrored from its events (`DedanCells.attest`): per human, cell and node the newest
+    /// sample is the vote and withdraws the previous one when that sits in today's or yesterday's histogram;
+    /// a cell's record for a node is the lower-middle median over both days, as the bucket midpoint. Cells
+    /// without `k_min` votes borrow the merged histograms of their neighbours, ring by ring. `now` is the
+    /// chain's clock (the head block's time), so the window is the contract's.
+    pub fn from_votes(
         events: &[AttestedEvent],
-        reveals: &RevealSet,
+        _members: &Membership,
         labels: &HashMap<B256, NodeId>,
-        geo: &dyn GeoLocate,
         now: u64,
         params: &MapParams,
-    ) -> (Map, Vec<Evidence>) {
-        let mut v = Validator::new(params.clone(), reveals, geo);
-        let (rows, evidence) = v.validate_events(events, labels);
-        (Map::build(&rows, now, params), evidence)
+    ) -> Map {
+        let today = now / params.epoch_s;
+        let nb = params.buckets;
+        // per human, cell and node: (epoch, bucket, rtt, ts) of its current vote
+        let mut votes: HashMap<(Address, Cell, NodeId), (u64, usize, u32, u64)> = HashMap::new();
+        let mut hist: HashMap<(Cell, NodeId, u64), Vec<u32>> = HashMap::new();
+        for e in events {
+            let Some(node) = labels.get(&e.label_hash) else {
+                continue;
+            };
+            let epoch = e.ts / params.epoch_s;
+            let bucket = ((e.rtt_ms / params.bucket_ms) as usize).min(nb - 1);
+            let key = (e.attester, e.cell, node.clone());
+            if let Some((pe, pb, _, _)) = votes.get(&key) {
+                if pe + 1 >= epoch {
+                    if let Some(h) = hist.get_mut(&(e.cell, node.clone(), *pe)) {
+                        h[*pb] = h[*pb].saturating_sub(1);
+                    }
+                }
+            }
+            hist.entry((e.cell, node.clone(), epoch))
+                .or_insert_with(|| vec![0; nb])[bucket] += 1;
+            votes.insert(key, (epoch, bucket, e.rtt_ms, e.ts));
+        }
+        let mut voters: BTreeMap<Cell, BTreeMap<NodeId, Vec<Voter>>> = BTreeMap::new();
+        for ((attester, cell, node), (epoch, _, rtt_ms, ts)) in &votes {
+            if *epoch + 1 < today || *epoch > today {
+                continue;
+            }
+            voters
+                .entry(*cell)
+                .or_default()
+                .entry(node.clone())
+                .or_default()
+                .push(Voter {
+                    attester: *attester,
+                    rtt_ms: *rtt_ms,
+                    ts: *ts,
+                });
+        }
+        for nodes in voters.values_mut() {
+            for v in nodes.values_mut() {
+                v.sort_by_key(|x| (x.rtt_ms, x.attester));
+            }
+        }
+        // the window: today and yesterday, merged per cell and node; nodes without a vote left drop out
+        let mut window: BTreeMap<Cell, BTreeMap<NodeId, Vec<u32>>> = BTreeMap::new();
+        for ((cell, node, epoch), h) in &hist {
+            if *epoch + 1 < today || *epoch > today {
+                continue;
+            }
+            let w = window
+                .entry(*cell)
+                .or_default()
+                .entry(node.clone())
+                .or_insert_with(|| vec![0; nb]);
+            for (i, c) in h.iter().enumerate() {
+                w[i] += c;
+            }
+        }
+        for nodes in window.values_mut() {
+            nodes.retain(|_, h| h.iter().sum::<u32>() > 0);
+        }
+        window.retain(|_, nodes| !nodes.is_empty());
+        let mut map = Map {
+            voters,
+            ..Map::default()
+        };
+        map.nodes_seen = window
+            .values()
+            .flat_map(|m| m.keys().cloned())
+            .collect();
+        let measured: Vec<Cell> = window.keys().copied().collect();
+        for c in &measured {
+            for d in geo::disk(*c, params.rings) {
+                if map.ranks.contains_key(&d) {
+                    continue;
+                }
+                if let Some(rank) = Self::rank_votes(d, &window, params) {
+                    if rank.rings == 0 {
+                        map.covered.insert(d);
+                    }
+                    map.ranks.insert(d, rank);
+                }
+            }
+        }
+        map.node_location = map.estimate_locations();
+        map
+    }
+
+    /// The first ring around `cell` whose merged histograms reach `k_min` votes for some node.
+    fn rank_votes(
+        cell: Cell,
+        window: &BTreeMap<Cell, BTreeMap<NodeId, Vec<u32>>>,
+        params: &MapParams,
+    ) -> Option<CellRank> {
+        for r in 0..=params.rings {
+            let mut merged: BTreeMap<NodeId, Vec<u32>> = BTreeMap::new();
+            for c in geo::disk(cell, r) {
+                let Some(nodes) = window.get(&c) else { continue };
+                for (n, h) in nodes {
+                    let m = merged
+                        .entry(n.clone())
+                        .or_insert_with(|| vec![0; h.len()]);
+                    for (i, v) in h.iter().enumerate() {
+                        m[i] += v;
+                    }
+                }
+            }
+            let humans = merged
+                .values()
+                .map(|h| h.iter().sum::<u32>())
+                .max()
+                .unwrap_or(0) as usize;
+            if humans < params.k_min {
+                continue;
+            }
+            let mut nodes: Vec<(NodeId, u32)> = merged
+                .iter()
+                .map(|(n, h)| (n.clone(), histogram_median(h, params.bucket_ms)))
+                .collect();
+            nodes.sort_by(|(na, va), (nb, vb)| (va, na).cmp(&(vb, nb)));
+            return Some(CellRank {
+                humans,
+                rings: r,
+                nodes,
+            });
+        }
+        None
     }
 
     fn rank_for(
@@ -508,6 +638,23 @@ impl Map {
     }
 }
 
+/// The lower-middle median of a histogram as the bucket midpoint, what `DedanCells.median` answers; 0 when empty.
+pub fn histogram_median(h: &[u32], bucket_ms: u32) -> u32 {
+    let total: u32 = h.iter().sum();
+    if total == 0 {
+        return 0;
+    }
+    let half = (total - 1) / 2;
+    let mut acc = 0;
+    for (b, c) in h.iter().enumerate() {
+        acc += c;
+        if acc > half {
+            return b as u32 * bucket_ms + bucket_ms / 2;
+        }
+    }
+    0
+}
+
 /// Lower-middle median of an unsorted slice; 0 for an empty one.
 pub fn median(values: &[u32]) -> u32 {
     if values.is_empty() {
@@ -567,8 +714,23 @@ mod tests {
     fn batch(a: u8, attestations: Vec<Attestation>) -> AttestationBatch {
         AttestationBatch {
             auditor_id: auditor(a),
+            cell: c(ISTANBUL),
             epoch: EPOCH,
             attestations,
+        }
+    }
+
+    fn ev(a: u8, cell: Cell, label: &str, rtt: u32, ts: u64) -> AttestedEvent {
+        AttestedEvent {
+            attester: Address::from([a; 20]),
+            cell,
+            label_hash: node(label).label_hash(),
+            rtt_ms: rtt,
+            hit_ttfb_ms: 0,
+            token: "ok".into(),
+            prefix: IST_PREFIX.into(),
+            ts,
+            block: 1,
         }
     }
 
@@ -598,25 +760,22 @@ mod tests {
             1,
             vec![
                 att(ist, "fra", 10, TS, "ok"),
-                att(ist, "fra", 11, TS + 1, "ok"),
-                att(ist, "fra", 12, TS + 2, "ok"),
-                att(ist, "fra", 13, TS + 3, "ok"), // 4th to the same node: over cap
+                att(ist, "fra", 11, TS + 1, "ok"), // again: the contract keeps the newest vote, the validator both
+                att(near, "tok", 20, TS + 5, "ok"), // the neighbouring cell, 300 km from this network: out of area
                 tokyo_from_istanbul, // Tokyo cell from an Istanbul network: out of area
-                att(near, "tok", 20, TS + 5, "ok"), // second cell in the epoch
                 att(ist, "sel", 30, TS + 6, "bad"), // token does not verify
                 unknown,             // a network nobody can place
                 att(ist, "sel", 30, TS + 200_000, "ok"), // outside the batch's epoch
             ],
         );
         let (ok, bad) = v.validate_batch(&b);
-        assert_eq!(ok.len(), 3);
+        assert_eq!(ok.len(), 2);
         let reasons: Vec<&Rejection> = bad.iter().map(|e| &e.reason).collect();
-        assert!(matches!(reasons[0], Rejection::OverCap));
-        assert!(matches!(reasons[1], Rejection::OutOfArea { km } if *km > 8_000.0));
-        assert!(matches!(reasons[2], Rejection::CellChanged { epoch_cell } if *epoch_cell == ist));
-        assert!(matches!(reasons[3], Rejection::BadToken));
-        assert!(matches!(reasons[4], Rejection::UnknownLocation));
-        assert!(matches!(reasons[5], Rejection::WrongEpoch));
+        assert!(matches!(reasons[0], Rejection::OutOfArea { km } if *km > 8_000.0));
+        assert!(matches!(reasons[1], Rejection::OutOfArea { km } if *km > 250.0 && *km < 1_000.0));
+        assert!(matches!(reasons[2], Rejection::BadToken));
+        assert!(matches!(reasons[3], Rejection::UnknownLocation));
+        assert!(matches!(reasons[4], Rejection::WrongEpoch));
     }
 
     #[test]
@@ -647,14 +806,9 @@ mod tests {
             ev(node("nope").label_hash(), &good),
             ev(node("fra").label_hash(), "fra.1.00"),
         ];
-        let (map, evidence) = Map::from_chain(
-            &events,
-            &reveals,
-            &labels,
-            &geo,
-            TS + 10,
-            &MapParams::devnet(),
-        );
+        let params = MapParams::devnet();
+        let (rows, evidence) = Validator::new(params.clone(), &reveals, &geo).validate_events(&events, &labels);
+        let map = Map::build(&rows, TS + 10, &params);
         assert_eq!(map.rtt(c(ISTANBUL), &node("fra")), Some(12));
         assert_eq!(evidence.len(), 2);
         assert!(matches!(evidence[0].reason, Rejection::UnknownNode));
@@ -747,8 +901,8 @@ mod tests {
         }); // stale
         let map = Map::build(&rows, TS + 10, &MapParams::devnet());
         assert!(!map.nodes_seen.contains(&node("n3")));
-        assert!(geo::distance_km(map.location(&node("n1")).unwrap(), ISTANBUL) < 20.0);
-        assert!(geo::distance_km(map.location(&node("n2")).unwrap(), FRANKFURT) < 20.0);
+        assert!(geo::distance_km(map.location(&node("n1")).unwrap(), ISTANBUL) < 200.0);
+        assert!(geo::distance_km(map.location(&node("n2")).unwrap(), FRANKFURT) < 200.0);
         assert_eq!(
             map.rank(fra).unwrap().nodes,
             vec![(node("n2"), 8), (node("n1"), 40)]
@@ -756,6 +910,58 @@ mod tests {
         let json = serde_json::to_string(&map).unwrap();
         let back: Map = serde_json::from_str(&json).unwrap();
         assert_eq!(back.ranks, map.ranks);
+    }
+
+    /// The contract's rules, replayed: one vote per human per node per cell (newest wins, also across
+    /// yesterday), medians as bucket midpoints over two days, ring search for cells without votes.
+    #[test]
+    fn votes_mirror_the_contract() {
+        let ist = c(ISTANBUL);
+        let fra = c(FRANKFURT);
+        let labels = HashMap::from([
+            (node("n1").label_hash(), node("n1")),
+            (node("n2").label_hash(), node("n2")),
+        ]);
+        let members = Membership::new();
+        let p = MapParams::devnet();
+        let day = TS / 86_400 * 86_400;
+        let events = vec![
+            ev(1, ist, "n1", 10, day - 3_600), // yesterday
+            ev(1, ist, "n1", 90, day + 60),    // the same human again today: replaces yesterday's vote
+            ev(2, ist, "n1", 20, day + 120),
+            ev(3, ist, "n1", 40, day + 180),
+            ev(1, ist, "n2", 5, day + 240),
+            ev(1, fra, "n2", 300, day + 300), // the same human in another cell: an independent vote
+            ev(4, ist, "n2", 5, day - 3 * 86_400), // three days old: outside the window
+        ];
+        let map = Map::from_votes(&events, &members, &labels, day + 400, &p);
+        let rank = map.rank(ist).unwrap();
+        assert_eq!(rank.rings, 0);
+        assert_eq!(rank.humans, 3);
+        let who: Vec<(u8, u32)> = map.voters[&ist][&node("n1")]
+            .iter()
+            .map(|v| (v.attester.0[0], v.rtt_ms))
+            .collect();
+        assert_eq!(who, vec![(2, 20), (3, 40), (1, 90)], "the votes behind n1's median, by rtt");
+        assert_eq!(map.voters[&fra][&node("n2")].len(), 1);
+        assert!(!map.voters[&ist].contains_key(&node("n3")));
+        // n1: votes 90, 20, 40 -> the lower-middle is 40, bucket 5 (40-48 ms), midpoint 44; n2: one vote, 5 ms -> 4
+        assert_eq!(rank.nodes, vec![(node("n2"), 4), (node("n1"), 44)]);
+        assert_eq!(map.rank(fra).unwrap().nodes, vec![(node("n2"), 252)]); // last bucket, open-ended
+        assert!(map.covered.contains(&ist) && map.covered.contains(&fra));
+        // a neighbour of Istanbul borrows its votes
+        let near = geo::disk(ist, 1)[1];
+        assert_eq!(map.rank(near).unwrap().rings, 1);
+        assert_eq!(map.rank(near).unwrap().nodes[0], (node("n2"), 4));
+        assert_eq!(histogram_median(&[0, 2, 1], 8), 12);
+        assert_eq!(histogram_median(&[], 8), 0);
+        // k_min: two votes needed and only one there -> not covered
+        let strict = MapParams {
+            k_min: 2,
+            ..MapParams::devnet()
+        };
+        let map = Map::from_votes(&events[4..5], &members, &labels, day + 400, &strict);
+        assert!(map.rank(ist).is_none());
     }
 
     #[test]

@@ -1,0 +1,5 @@
+somes frankfurt 322 13
+somes tokyo 56 3
+somes seoul 16 1
+somes newyork 426 18
+somes istanbul 362 15

@@ -55,7 +55,7 @@ contract DedanRegistryTest is Test {
         root = new PermissionedRegistry(labelStore, gov, TLD_GOV_ROLES);
         eth = new PermissionedRegistry(labelStore, gov, TLD_GOV_ROLES);
         dedan = new DedanRegistry(labelStore, gov, usdc, IWorldIDVerifier(address(worldId)), 1, "dedan.eth");
-        resolver = new DedanResolver(IPermissionedRegistry(address(dedan)));
+        resolver = new DedanResolver(IPermissionedRegistry(address(dedan)), "dedan.eth");
         dedan.setDedanResolver(resolver);
         root.register("eth", gov, IRegistry(address(eth)), address(0), LABEL_OWNER_ROLES, type(uint64).max);
         eth.setParent(IRegistry(address(root)), "eth");
@@ -194,7 +194,7 @@ contract DedanRegistryTest is Test {
         assertEq(dedan.ownerOf(dedan.getTokenId(id)), op1, "regenerated token stays with the owner");
     }
 
-    function test_revealKey_and_attest_are_role_gated() public {
+    function test_revealKey_is_role_gated_and_attesters_can_be_suspended() public {
         registerFra(op1);
         vm.prank(hot1);
         vm.expectEmit(true, true, false, true);
@@ -206,23 +206,9 @@ contract DedanRegistryTest is Test {
 
         vm.prank(attester);
         dedan.registerAttester(proof(50));
-        DedanRegistry.Attestation[] memory batch = new DedanRegistry.Attestation[](2);
-        batch[0] = DedanRegistry.Attestation(1, bytes32(labelId()), 12, 20, "tok", "10.77.0.0/24");
-        batch[1] = DedanRegistry.Attestation(1, bytes32(labelId()), 14, 21, "tok2", "10.77.0.0/24");
-        vm.prank(attester);
-        vm.expectEmit(true, true, true, true);
-        emit DedanRegistry.Attested(
-            attester, 1, bytes32(labelId()), 12, 20, "tok", "10.77.0.0/24", uint64(block.timestamp)
-        );
-        dedan.attest(batch);
-        vm.prank(stranger);
-        vm.expectPartialRevert(IEnhancedAccessControl.EACUnauthorizedAccountRoles.selector);
-        dedan.attest(batch);
+        assertTrue(dedan.isAttester(attester));
         vm.prank(gov);
         dedan.suspendAccount(attester, true);
-        vm.prank(attester);
-        vm.expectRevert(DedanRegistry.AccountIsSuspended.selector);
-        dedan.attest(batch);
         assertFalse(dedan.isAttester(attester));
     }
 

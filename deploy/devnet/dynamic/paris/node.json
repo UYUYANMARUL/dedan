@@ -1,2 +1,0 @@
-{ "count": 1, "nodes": [ { "label": "paris", "ip": "10.77.96.1", "port": 80, "class": "100M", "location": "48.8566,2.3522", "cell": "599536505630752767",
-  "operator": 30, "hotKey": 31, "attester": 32, "user": "user-paris" } ] }

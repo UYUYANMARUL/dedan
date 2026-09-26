@@ -1,0 +1,20 @@
+[package]
+name = "dedan-aggregator"
+version = "0.1.0"
+description = "Dedan's aggregator and countersigner: probe results in, published inputs and countersigned settlement roots out; recompute for anyone"
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+dedan-core = { path = "../core" }
+alloy = { version = "2.5", features = ["provider-http", "rpc-types", "sol-types", "signer-local", "contract"] }
+axum = "0.8"
+hex = "0.4"
+reqwest = { version = "0.13", default-features = false, features = ["json"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+sha2 = "0.11"
+tokio = { version = "1", features = ["full"] }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }

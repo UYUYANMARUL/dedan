@@ -9,6 +9,7 @@ use alloy::providers::Provider;
 use alloy::sol;
 use alloy::sol_types::{SolCall, SolValue};
 use serde::{Deserialize, Serialize};
+use std::collections::BTreeMap;
 use std::net::{Ipv4Addr, Ipv6Addr};
 
 sol! {
@@ -190,6 +191,19 @@ impl<P: Provider + Clone> EnsClient<P> {
             enc_key: self.text(&name, node, KEY_ENCKEY).await?,
             version: self.text(&name, node, KEY_VERSION).await?,
         })
+    }
+
+    /// The records of every given name, in one table. ponytail: sequential reads; batch them through
+    /// `multicall` once the node count makes the sync tick visible.
+    pub async fn node_records<'a>(
+        &self,
+        labels: impl IntoIterator<Item = &'a NodeId>,
+    ) -> Result<BTreeMap<NodeId, NodeRecord>, EnsError> {
+        let mut out = BTreeMap::new();
+        for label in labels {
+            out.insert(label.clone(), self.node_record(label).await?);
+        }
+        Ok(out)
     }
 }
 

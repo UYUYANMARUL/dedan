@@ -9,10 +9,4 @@ user-tokyo         tokyo      10.77.32.30   user    35.6762   139.6503
 user-seoul         seoul      10.77.48.30   user    37.5665   126.978
 user-newyork       newyork    10.77.64.30   user    40.7128   -74.006
 user-istanbul      istanbul   10.77.80.30   user    41.0082   28.9784
-paris              paris      10.77.96.1    node    48.8566 2.3522
-user-paris         paris      10.77.96.30   user    48.8566 2.3522
-asd                asd        10.77.112.1   node    24.0522 -38.2437
-user-asd           asd        10.77.112.30  user    24.0522 -38.2437
-user-berlin        berlin     10.77.1.30    user    52.52 13.405
-user-madrid        madrid     10.77.2.30    user    40.4168 -3.7038
-user-madris-close  madris-close 10.77.3.30    user    44.4168 -7.7038
+user-some          some       10.77.1.30    user    35.0 26.0

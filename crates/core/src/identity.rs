@@ -1,5 +1,5 @@
-//! The identity cache (ARCHITECTURE.md §3, §11): every role, node, stake, suspension, key reveal and
-//! attestation of the Dedan registry, replayed from its events. Envelope verifiers, the map builder and
+//! The identity cache (ARCHITECTURE.md §3, §11): every role, node, stake, suspension, key reveal, cell
+//! membership and attestation of the Dedan registry and the cells contract, replayed from their events. Envelope verifiers, the map builder and
 //! the assignment read from here; nothing on a request path touches the chain.
 //!
 //! Roles are Enhanced Access Control bitmaps per resource. A node's resource is its label id with the
@@ -11,6 +11,7 @@ use crate::envelope::KeyLookup;
 use crate::map::{AttestedEvent, RevealSet};
 use crate::types::*;
 use alloy::primitives::{keccak256, Address, B256, U256};
+use alloy::eips::BlockNumberOrTag;
 use alloy::providers::Provider;
 use alloy::rpc::types::{Filter, Log};
 use alloy::sol;
@@ -47,6 +48,10 @@ sol! {
     event KeyRevealed(bytes32 indexed labelHash, uint64 indexed hour, bytes32 kHour);
     #[derive(Debug)]
     event Attested(address indexed attester, uint64 indexed cell, bytes32 indexed labelHash, uint32 rttMs, uint32 hitTtfbMs, bytes token, bytes prefix, uint64 ts);
+    #[derive(Debug)]
+    event Joined(uint64 indexed cell, bytes32 indexed labelHash);
+    #[derive(Debug)]
+    event Left(uint64 indexed cell, bytes32 indexed labelHash);
 }
 
 /// Role bits of `DedanRoles.sol`, one nybble each.
@@ -155,6 +160,14 @@ pub enum RegistryEvent {
         k_hour: B256,
     },
     Attested(AttestedEvent),
+    Joined {
+        cell: Cell,
+        label_hash: B256,
+    },
+    Left {
+        cell: Cell,
+        label_hash: B256,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -188,8 +201,11 @@ pub struct Identity {
     pub min_stake: BTreeMap<u8, u128>,
     /// `Attested` events in chain order, the map's input.
     pub attested: Vec<AttestedEvent>,
-    /// Last block folded in.
+    /// The nodes that joined each cell (`DedanCells.join`), the cell's members.
+    pub members: BTreeMap<Cell, BTreeSet<NodeId>>,
+    /// Last block folded in, and its timestamp: the chain's clock, which the map's window follows.
     pub block: u64,
+    pub block_time: u64,
     versions: HashMap<B256, u32>,
     /// Signer keys by (label base, EAC version).
     signers: HashMap<(B256, u32), BTreeSet<Address>>,
@@ -318,6 +334,18 @@ impl Identity {
                 }
             }
             RegistryEvent::Attested(e) => self.attested.push(e),
+            RegistryEvent::Joined { cell, label_hash } => {
+                if let Some(label) = self.labels.get(&label_base(label_hash)).cloned() {
+                    self.members.entry(cell).or_default().insert(label);
+                }
+            }
+            RegistryEvent::Left { cell, label_hash } => {
+                if let Some(label) = self.labels.get(&label_base(label_hash)).cloned() {
+                    if let Some(set) = self.members.get_mut(&cell) {
+                        set.remove(&label);
+                    }
+                }
+            }
         }
     }
 
@@ -472,18 +500,31 @@ impl Identity {
                 ts: d.ts,
                 block: log.block_number.unwrap_or(0),
             })
+        } else if t == Joined::SIGNATURE_HASH {
+            let d = log.log_decode::<Joined>().ok()?.inner.data;
+            RegistryEvent::Joined {
+                cell: Cell(d.cell),
+                label_hash: d.labelHash,
+            }
+        } else if t == Left::SIGNATURE_HASH {
+            let d = log.log_decode::<Left>().ok()?.inner.data;
+            RegistryEvent::Left {
+                cell: Cell(d.cell),
+                label_hash: d.labelHash,
+            }
         } else {
             return None;
         };
         Some(ev)
     }
 
-    /// Folds every registry event up to `to_block` into the cache. Returns how many were applied.
+    /// Folds every event of `contracts` (the registry and the cells contract) up to `to_block` into the
+    /// cache, and notes that block's time. Returns how many events were applied.
     /// ponytail: one `eth_getLogs` for the whole range; chunk it when a public RPC caps the range.
     pub async fn replay<P: Provider>(
         &mut self,
         provider: &P,
-        registry: Address,
+        contracts: &[Address],
         to_block: u64,
     ) -> Result<usize, IdentityError> {
         let from = if self.block == 0 && self.nodes.is_empty() && self.humans.is_empty() {
@@ -495,7 +536,7 @@ impl Identity {
             return Ok(0);
         }
         let filter = Filter::new()
-            .address(registry)
+            .address(contracts.to_vec())
             .from_block(from)
             .to_block(to_block);
         let logs = provider.get_logs(&filter).await?;
@@ -507,8 +548,18 @@ impl Identity {
             }
         }
         self.block = to_block;
+        self.block_time = block_time(provider, to_block).await?;
         Ok(applied)
     }
+}
+
+/// The timestamp of a block: the chain's clock.
+pub async fn block_time<P: Provider>(provider: &P, number: u64) -> Result<u64, IdentityError> {
+    Ok(provider
+        .get_block_by_number(BlockNumberOrTag::Number(number))
+        .await?
+        .map(|b| b.header.timestamp)
+        .unwrap_or(0))
 }
 
 impl KeyLookup for Identity {
@@ -723,11 +774,12 @@ mod tests {
         )
         .unwrap();
         let registry: Address = dep["dedanRegistry"].as_str().unwrap().parse().unwrap();
+        let cells: Address = dep["dedanCells"].as_str().unwrap().parse().unwrap();
         let url = std::env::var("DEDAN_RPC_URL").unwrap_or_else(|_| "http://127.0.0.1:8545".into());
         let provider = ProviderBuilder::new().connect_http(url.parse().unwrap());
         let head = provider.get_block_number().await.unwrap();
         let mut id = Identity::default();
-        let applied = id.replay(&provider, registry, head).await.unwrap();
+        let applied = id.replay(&provider, &[registry, cells], head).await.unwrap();
         assert!(
             applied >= 20,
             "min stakes, five nodes with roles, five attesters; got {applied}"
@@ -741,9 +793,67 @@ mod tests {
         assert!(id.humans.values().filter(|h| h.attester).count() >= 5);
         assert_eq!(id.min_stake[&STAKE_AUDITOR], 100_000_000);
         assert_eq!(
-            id.replay(&provider, registry, head).await.unwrap(),
+            id.replay(&provider, &[registry, cells], head).await.unwrap(),
             0,
             "idempotent"
         );
+    }
+
+    /// The readers' mirror equals the contract: for every cell and member the contract holds votes for,
+    /// `Map::from_votes` over the replayed events gives the same median as `DedanCells.median`.
+    #[tokio::test]
+    #[ignore = "needs a running devnet with votes (make demo or make demo-settlement)"]
+    async fn mirror_matches_the_contract_medians() {
+        use crate::map::{Map, MapParams};
+        use alloy::providers::ProviderBuilder;
+        use alloy::sol;
+        sol! {
+            #[sol(rpc)]
+            interface IDedanCells {
+                function median(uint64 cell, uint256 labelId) external view returns (uint32 ms, uint32 votes);
+            }
+        }
+        let root = concat!(env!("CARGO_MANIFEST_DIR"), "/../..");
+        let dep: serde_json::Value = serde_json::from_str(
+            &std::fs::read_to_string(format!("{root}/contracts/deployments/devnet.json")).unwrap(),
+        )
+        .unwrap();
+        let registry: Address = dep["dedanRegistry"].as_str().unwrap().parse().unwrap();
+        let cells: Address = dep["dedanCells"].as_str().unwrap().parse().unwrap();
+        let url = std::env::var("DEDAN_RPC_URL").unwrap_or_else(|_| "http://127.0.0.1:8545".into());
+        let provider = ProviderBuilder::new().connect_http(url.parse().unwrap());
+        let head = provider.get_block_number().await.unwrap();
+        let mut id = Identity::default();
+        id.replay(&provider, &[registry, cells], head).await.unwrap();
+        let map = Map::from_votes(
+            &id.attested,
+            &id.members,
+            &id.labels_by_hash(),
+            id.block_time,
+            &MapParams::devnet(),
+        );
+        let contract = IDedanCells::new(cells, provider.clone());
+        let mut compared = 0;
+        for (cell, members) in &id.members {
+            for node in members {
+                let theirs = contract
+                    .median(cell.0, U256::from_be_bytes(node.label_hash().0))
+                    .call()
+                    .await
+                    .unwrap();
+                let mine = map
+                    .ranks
+                    .get(cell)
+                    .filter(|r| r.rings == 0)
+                    .and_then(|r| r.nodes.iter().find(|(n, _)| n == node).map(|(_, ms)| *ms));
+                if theirs.votes == 0 {
+                    assert_eq!(mine, None, "{node} in cell {cell}: the contract has no votes");
+                    continue;
+                }
+                assert_eq!(mine, Some(theirs.ms), "{node} in cell {cell} ({} votes)", theirs.votes);
+                compared += 1;
+            }
+        }
+        assert!(compared > 0, "no votes on the devnet yet");
     }
 }

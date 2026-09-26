@@ -421,8 +421,9 @@ pub fn score(inp: &ScoreInput, p: &ScoreParams) -> ScoreOutput {
                         && x.served_by.as_ref() == Some(n)
                         && x.probe == ProbeType::Targeted
                         && x.metrics.bytes.unwrap_or(0) >= p.throughput_min_bytes)
-                        .then_some(x.metrics.mbps)
+                        .then_some(x.metrics.kbps)
                         .flatten()
+                        .map(|k| k as f64 / 1000.0)
                 })
                 .collect();
             let throughput = if tp.is_empty() {
@@ -728,7 +729,7 @@ mod tests {
                 good.metrics = ProbeMetrics {
                     sha256: Some("cur".into()),
                     bytes: Some(2_000_000),
-                    mbps: Some(40.0),
+                    kbps: Some(40_000),
                     ..Default::default()
                 };
                 v.push(good);

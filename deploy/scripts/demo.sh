@@ -1,9 +1,10 @@
 #!/bin/sh
 # Devnet demo. Needs a running devnet (`make devnet`). Cities added with add-node.sh take part like the static five.
 #   1. measured round trips between the city nodes
-#   2. the node names and records as the nameserver resolved them from ENS
-#   3. verified humans (city users and added clients) attest round trips to every node, to the registry contract, with the fetch
-#      tokens the nodes minted; the map is rebuilt from those events; a spoofed batch is rejected
+#   2. the node names and records as the nameserver resolved them from ENS, and the cells the nodes joined
+#   3. verified humans (city users and added clients) attest round trips to the members of their cell, to the cells
+#      contract, with the fetch tokens the nodes minted: one vote per human per node per cell, medians on chain;
+#      a spoofed batch counts as one vote and lands in the evidence
 #   4. what the nameserver answers for a client in each city (ECS), and the customer onboarding chain
 #   5. the Frankfurt operator changes its node's IP record on chain; the DNS answer follows
 #   6. every city's user resolving www.images.com and fetching an image by name: different nodes, same bytes as
@@ -33,23 +34,35 @@ for n in json.load(sys.stdin)['nodes']:
     print('%-22s ipv4=%-12s class=%s location=%s,%s owner=%s signers=%d active=%s' % (n['name'], n['ipv4'], n['class'], n['location']['lat'], n['location']['lon'], n['owner'][:10], len(n['signers']), n['active']))"
 
 echo
-echo "== hot keys reveal this hour's token key on chain, then a verified human in each city attests round trips"
+echo "== the cells the nodes joined (<cell>.dedan.eth, resolution-2 regions; GET /cells)"
+curl -s "$NS_API/cells" | python3 -c "
+import json,sys
+for c in json.load(sys.stdin)['cells']:
+    print('%-26s centre %7.2f,%7.2f  members: %s' % (c['name'], c['centre']['lat'], c['centre']['lon'], ', '.join(c['members'])))"
+
+echo
+echo "== hot keys reveal this hour's token key on chain, then a verified human in each city attests its cell's members"
 for c in $all; do reveal_key "$c"; done
-for h in $(users); do attest_from "$h" $all || true; done   # an unverified client's batch is rejected: that is the point
-# a spoofed batch: an Istanbul human claims the Tokyo cell; the token still binds its Istanbul network
+for h in $(users); do attest_from "$h" || true; done   # an unverified client's batch is rejected: that is the point
+# a spoofed batch: an Istanbul human claims the Tokyo cell; the contract takes it as one vote, the token still
+# binds its Istanbul network, so the map's evidence names it
 token=$(fetch_token istanbul "$(node_ip tokyo)")
-cast send "$(registry)" "\"attest((uint64,bytes32,uint32,uint32,bytes,bytes)[])\"" \
-  "\"[($(node_field tokyo cell),$(cast keccak tokyo | tr -d '\r\n'),1,0,$(hex "$token"),$(hex "$(user_ip istanbul | awk -F. '{printf "%s.%s.%s.0/24", $1, $2, $3}')"))]\"" \
+cast send "$(cells_contract)" "\"attest(uint64,(bytes32,uint32,uint32,bytes,bytes)[])\"" "$(node_field tokyo cell)" \
+  "\"[($(cast keccak tokyo | tr -d '\r\n'),1,0,$(hex "$token"),$(hex "$(user_ip istanbul | awk -F. '{printf "%s.%s.%s.0/24", $1, $2, $3}')"))]\"" \
   --private-key "$(private_key "$(node_field istanbul attester)")" --rpc-url http://anvil:8545 >/dev/null
-echo "istanbul: also claimed a 1 ms round trip to tokyo from the Tokyo cell (spoofed)"
-echo "waiting for the nameserver to rebuild the map from the chain..."; sleep 12
+echo "istanbul: also claimed a 1 ms round trip to tokyo from the Tokyo cell (spoofed: one vote there, evidence below)"
+echo "waiting for the nameserver to mirror the contract's map from the chain..."; sleep 12
 curl -s "$NS_API/map" | python3 -c "
 import json,sys
 m=json.load(sys.stdin)
 print('attestations on chain: %d, key reveals: %d, covered cells: %d' % (m['attestations'], m['reveals'], m['covered']))
 for r in m['ranks']:
-    if r['rings']==0: print('  cell %d: ' % r['cell'] + ', '.join('%s %sms' % (n,v) for n,v in r['nodes']))
-for e in m['rejected']: print('  rejected: %s by %s (%s)' % (e['reason'], e['auditor'][:10], e.get('node')))"
+    if r['rings']==0: print('  cell %d (%d votes): ' % (r['cell'], r['humans']) + ', '.join('%s %sms' % (n,v) for n,v in r['nodes']))
+for e in m['rejected']: print('  evidence: %s by %s (%s)' % (e['reason'], e['auditor'][:10], e.get('node')))"
+echo "-- the same medians as ENS records, read through the Universal Resolver:"
+fra_cell=$(python3 -c "print('%x' % $(node_field frankfurt cell))")
+echo "frankfurt.$fra_cell.dedan.eth dedan.latency = $(ens_text "frankfurt.$fra_cell.dedan.eth" dedan.latency) ms, dedan.votes = $(ens_text "frankfurt.$fra_cell.dedan.eth" dedan.votes)"
+echo "$fra_cell.dedan.eth dedan.nodes = $(ens_text "$fra_cell.dedan.eth" dedan.nodes)"
 
 echo
 echo "== the nameserver's answer for www.images.com by client city (dig +subnet, as recursive resolvers send it)"

@@ -21,6 +21,21 @@ for f in ['deploy/devnet/nodes.json'] + sorted(glob.glob('deploy/devnet/dynamic/
         if n['label'] == '$1': print(n['$2']); sys.exit()
 sys.exit('no node $1')"; }
 registry() { python3 -c "import json; print(json.load(open('contracts/deployments/devnet.json'))['dedanRegistry'])"; }
+deployed() { python3 -c "import json; print(json.load(open('contracts/deployments/devnet.json'))['$1'])"; }
+cells_contract() { deployed dedanCells; }
+# the nodes that joined a cell (from the nameserver's mirror of the chain), space-separated
+cell_members() { curl -s "$NS_API/cells" | python3 -c "
+import json,sys
+for c in json.load(sys.stdin)['cells']:
+    if c['cell'] == '$1': print(' '.join(c['members']))"; }
+# the H3 resolution-2 cell of a point, and with a third argument the cells within k rings (JSON array)
+cell_of() { curl -sf "$NS_API/cell?lat=$1&lon=$2&k=${3:-0}" | python3 -c "import json,sys; d=json.load(sys.stdin); print(d['cell'] if '${3:-}' == '' else json.dumps([int(c) for c in d['cells']]))"; }
+# an ENS text record read the way any client does it: the Universal Resolver walks the tree from the root
+# (`resolve(dnsEncodedName, text(namehash, key))`) and answers from the name's resolver
+ens_text() {
+  dns=$(python3 -c "print('0x' + ''.join('%02x%s' % (len(l), l.encode().hex()) for l in '$1'.split('.')) + '00')")
+  $COMPOSE run --rm -T deployer "node=\$(cast namehash $1); data=\$(cast calldata 'text(bytes32,string)' \$node '$2'); out=\$(cast call $(deployed universalResolver) 'resolve(bytes,bytes)(bytes,address)' $dns \$data --rpc-url http://anvil:8545 | head -1); cast abi-decode 'f()(string)' \$out" 2>/dev/null | tr -d '\r\n"'
+}
 token_key() { python3 -c "import json; print(json.load(open('deploy/devnet/keys.json'))['k_hour'])"; }
 
 user() { c=$1; shift; docker exec -i "dedan-devnet-user-$c-1" "$@"; }
@@ -56,22 +71,28 @@ reveal_key() {
       --private-key "$(private_key "$(node_field "$1" hotKey)")" --rpc-url http://anvil:8545 >/dev/null
   done
 }
-# the human in city $1 (its registered attester, or the key ATTESTER_INDEX) pings and fetches from each node named
-# after it, then sends one attest batch; VERBOSE=1 prints every measurement and the transaction
+# the human in city $1 (its registered attester, or the key ATTESTER_INDEX) pings and fetches from every node
+# that joined its cell (or those of them named after it), then sends one attest batch to the cells contract;
+# VERBOSE=1 prints every measurement and the transaction
 attest_from() {
   c=$1; shift
   cell=$(node_field "$c" cell); prefix=$(user_ip "$c" | awk -F. '{printf "%s.%s.%s.0/24", $1, $2, $3}')
-  items=""
-  for n in "$@"; do
+  members=$(cell_members "$cell")
+  if [ $# -gt 0 ]; then targets=""; for n in "$@"; do case " $members " in *" $n "*) targets="$targets $n";; esac; done; else targets=$members; fi
+  [ -n "$(echo $targets)" ] || { echo "$c: no node has joined cell $cell (members: ${members:-none}); nothing to attest"; return 1; }
+  items=""; count=0
+  for n in $targets; do
     ip=$(node_ip "$n"); rtt=$(ping_rtt "user-$c" "$ip"); tok=$(fetch_token "$c" "$ip")
     [ -z "${VERBOSE:-}" ] || echo "  $n ($ip): $rtt ms, token ${tok:-none}"
-    items="$items$([ -n "$items" ] && echo ,)($cell,$(cast keccak "$n" | tr -d '\r\n'),$rtt,0,$(hex "$tok"),$(hex "$prefix"))"
+    items="$items$([ -n "$items" ] && echo ,)($(cast keccak "$n" | tr -d '\r\n'),$rtt,0,$(hex "$tok"),$(hex "$prefix"))"; count=$((count + 1))
   done
-  if ! out=$(cast send "$(registry)" "\"attest((uint64,bytes32,uint32,uint32,bytes,bytes)[])\"" "\"[$items]\"" \
+  if ! out=$(cast send "$(cells_contract)" "\"attest(uint64,(bytes32,uint32,uint32,bytes,bytes)[])\"" "$cell" "\"[$items]\"" \
       --private-key "$(private_key "${ATTESTER_INDEX:-$(node_field "$c" attester)}")" --rpc-url http://anvil:8545 2>&1); then
     echo "attest from $c rejected by the contract:"; echo "$out" | grep -iE "error|revert|EAC" | head -3
-    echo "$out" | grep -q "custom error" && echo "(a custom error from DedanRegistry: the key holds no ROLE_ATTESTER, so this human is not World ID-verified; verify first)"
+    echo "$out" | grep -q "0xcab98054\|NotAttester" && echo "(NotAttester: the key holds no ROLE_ATTESTER, so this human is not World ID-verified; verify first)"
+    echo "$out" | grep -q "0x6fed7d85\|TooSoon" && echo "(TooSoon: a human may send one batch per cell per minute)"
+    echo "$out" | grep -q "0x291fc442\|NotMember" && echo "(NotMember: a node that did not join this cell cannot be attested in it)"
     return 1
   fi
-  echo "$c: attested $# round trips from $prefix (cell $cell)$([ -z "${VERBOSE:-}" ] || echo "$out" | awk '$1=="transactionHash" {printf ", tx %s", $2}')"
+  echo "$c: attested $count round trips from $prefix, one vote each in cell $cell$([ -z "${VERBOSE:-}" ] || echo "$out" | awk '$1=="transactionHash" {printf ", tx %s", $2}')"
 }

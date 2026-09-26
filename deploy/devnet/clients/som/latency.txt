@@ -1,0 +1,5 @@
+som frankfurt 382 16
+som tokyo 60 3
+som seoul 18 1
+som newyork 388 16
+som istanbul 338 14

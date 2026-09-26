@@ -71,6 +71,8 @@ Dedan deploys the ENSv2 contracts on World Chain: a root registry, an `eth` regi
 | Name / record | Owner | Content |
 |---|---|---|
 | `<label>.dedan.eth` | The node operator (an ERC-1155 token in `DedanRegistry`) | The node. Registration needs `ROLE_NODE_OPERATOR` and the node stake; the token carries the operator's roles and the stake follows the token |
+| `<cell>.dedan.eth` (the H3 index in hex, e.g. `821faffffffffff.dedan.eth`) | `DedanCells`, registered on the cell's first member | A cell: a resolution-2 H3 region about 300 km across. Its subregistry is `DedanRegistry` itself, so every node name resolves under it too. Records: `dedan.nodes` (the members), `dedan.latency.<label>` and `dedan.votes.<label>` (the medians on chain, §6), `dedan.cell` |
+| `<label>.<cell>.dedan.eth` | The same token as `<label>.dedan.eth` (no new token; the registry entry is shared) | The node inside a cell it joined (`DedanCells.join`): `dedan.latency` and `dedan.votes` are the cell's median for it, `dedan.cell` and `dedan.node` name both, every other key answers the node's own records. A cell the node never joined answers nothing |
 | `addr(60)` on the name | Operator | The payout address the settlement leaves are keyed by |
 | DNS A / AAAA records on the name (ENSIP-6) | Operator | The node's endpoint. Changing the IP is one `setDNSRecords` write; the resolvers pick it up within a minute |
 | `text` records `dedan.class`, `dedan.location`, `dedan.port`, `dedan.enckey`, `dedan.version` | Operator | Declared class, approximate location (cold start only), port, x25519 key, software version |
@@ -202,28 +204,28 @@ flowchart TD
 ### Sync loop
 
 1. Read the deployment (contract addresses, control-plane key, resolver list) once at start.
-2. Replay `DedanRegistry` events from the last seen block into the identity cache: names, owners, stakes, roles, suspensions, key reveals, attestations; keep the block number. Read every node's records through the Universal Resolver (`resolve(name, data)` per ENSIP-10): `addr`, `dedan.*` text, DNS A/AAAA.
+2. Replay `DedanRegistry` and `DedanCells` events from the last seen block into the identity cache: names, owners, stakes, roles, suspensions, key reveals, cell membership, attestations; keep the block number and its time (the chain's clock, which the map's window follows). Read every node's records through the Universal Resolver (`resolve(name, data)` per ENSIP-10): `addr`, `dedan.*` text, DNS A/AAAA.
 3. Consume the control-plane SSE stream: account configs (verify account-key signature and version), delegations, suspensions, signed ACME TXT records. On reconnect, replay from the last seq.
-4. Rebuild the latency map from the chain's `Attested` and `KeyRevealed` events (below) and recompute today's slot assignment from yesterday's published quality. Every resolver, auditor and the aggregator compute the same map and the same sets from the same chain.
+4. Mirror the latency map from the chain's `Attested` events with the contract's own rules (below) and recompute today's slot assignment from yesterday's published quality. Every resolver, auditor and the aggregator hold the contract's map and the same sets from the same chain, without asking the contract; the token and location checks the contract cannot make produce evidence.
 5. Re-verify every hostname's CNAME hourly; drop hostnames that no longer point at their account.
 
 ### Latency map (the public location function)
 
-Nobody declares where a node is. Verified humans measure it: the auditor app snaps the device location to an H3 cell (resolution 5, about 17 km across) and attests the round trip to every node it can reach, a few times a day, with one `attest` transaction to `DedanRegistry` (§7). The `Attested` events are the published attestations, and the map is a pure function of them, so every resolver and the aggregator hold the same map:
+Nobody declares where a node is. The map is the state of `DedanCells`, written by verified humans and read by everyone:
+
+- **Cells** are H3 resolution-2 regions, about 300 km across, and ENS names (§3). A node's operator **joins** the node to the cells it serves (its own and the ring around it on the devnet; a continent is about a hundred cells, one batch transaction). Only members of a cell can be attested in it, so a human measures a dozen nodes, not the whole network.
+- **Attestations**: the auditor app snaps the device location to its cell and, at most once a minute per cell, sends one `attest(cell, batch)` transaction with a round trip and the fetch token for each member it reached (§7). A human may attest from any cell it is in.
+- **Votes**: per human, cell and node the contract keeps one vote, the newest sample; a new sample withdraws the previous one, also when that one sits in yesterday's histogram. A liar has one vote; an honest human refines every minute.
+- **Histograms and medians**: votes land in the day's histogram of 32 buckets of 8 ms (the last one open-ended), two storage slots per cell, node and day. The cell's record for a node is the lower-middle median over today's and yesterday's votes, as the bucket midpoint (`DedanCells.median`, the `dedan.latency` text record of `<label>.<cell>.dedan.eth`). Old measurements age out with the days.
 
 ```
-map(window = 48 h) :
-  for each (cell, node): median rtt over distinct humans; humans(cell) = distinct auditors attesting in the cell
-  covered(cell)   = humans(cell) ≥ k                                            # k = 3 minimum, 5 target
-  anchors         = attestations made during assigned probes; a crowd median outside anchor ± 50 ms is replaced
-                    by the anchor median and the crowd rows go to evidence
-  rank(cell)      = nodes ordered by median; an uncovered cell aggregates grid_disk(cell, r) for r = 1..3 until
-                    covered, precomputed so a lookup is one hash read
-  location(node)  = centroid of the cells where the node ranks best; the operator's declared approximate location
-                    only while the node has no rows at all
+rank(cell)      = the cell's members ordered by median, once some member has k votes           # k = 3 minimum, 5 target
+                  (1 on the devnet); a cell without k votes merges the histograms of grid_disk(cell, r) for r = 1..2
+location(node)  = centroid of the cells where the node ranks best; the operator's declared approximate location
+                  only while the node has no votes at all
 ```
 
-One cell per human per epoch (24 h), the fetch token inside every attestation (it binds the /24 the node saw, which must geolocate within 250 km of the cell) and medians over k distinct humans make a cell expensive to corrupt: it takes more than half of its humans, each with a token from the node and an IP in the area (Appendix B).
+Resolvers, auditors and the aggregator do not query the contract for every cell: they replay the same rules from the `Attested` events (`core::map::from_votes`) and hold the identical map at any block, which a live test asserts against `median()`. The fetch token inside every attestation (it binds the /24 the node saw, which must geolocate within 250 km of the cell) and the human's World ID are what the *off-chain* checks use: an attestation whose token does not verify, or whose network is far from its cell, is not paid and is evidence for suspension (§7, Appendix B); its vote still counts once, which is why a cell's ranking needs k humans and a single human cannot move a median alone.
 
 ### Slot assignment (the public function)
 
@@ -295,7 +297,7 @@ Auditors are the only source of the location and quality numbers that money depe
 - Audit period = 1 h. Seed = hash of the first L1 block at or after the period start. Assignments and slot times are `hash(seed ‖ target ‖ auditor_id ‖ k)`; anyone can recompute who was supposed to probe what.
 - Each account is covered by at least 3 auditors (target 5), chosen by the schedule from wherever auditors are; a landing probe measures what a user in that auditor's cell gets. Each runs Poisson-timed probes with a 3 min mean, alternating landing and targeted across the slot members: about 60 probes per hour per account at 3 auditors, 1,400–2,400 per day, enough to resolve a 99.9% target with a significance test.
 - Every node in a /24: one coordinated class probe per day.
-- Attestations are opportunistic, not scheduled: the app measures every node it can reach a few times a day and submits one `attest(batch)` transaction (cents on World Chain). An attestation is valid when its token verifies against the key the node revealed on chain, the /24 inside the token geolocates within 250 km of the attested cell, the cell is the attester's only cell for the epoch (24 h), and the attester is within its caps (3 per node per epoch; 50 per epoch count for pay). The block time is the attestation's time, so nothing can be backdated. Attestations made during assigned probes are flagged as anchors.
+- Attestations are opportunistic, not scheduled: the app snaps its location to its cell (H3 resolution 2), measures the cell's members and submits one `attest(cell, batch)` transaction to `DedanCells` (cents on World Chain), at most once a minute per cell; it may attest from any cell it is in. The contract counts each sample as the human's one vote for that node in that cell, replacing its previous vote, and keeps the per-day histograms the medians are read from (§6). Off chain, for pay and evidence, an attestation is valid when its token verifies against the key the node revealed on chain and the /24 inside the token geolocates within 250 km of the attested cell; up to 50 per human per epoch count for pay. The block time is the attestation's time, so nothing can be backdated. Attestations made during assigned probes are flagged as anchors in the evidence path.
 - Probe traffic carries no marker. The auditor client presents a mainstream browser TLS and HTTP/2 fingerprint and sends the same `Accept-Encoding` a browser does; bodies are compared decoded.
 
 ### Results
@@ -456,14 +458,15 @@ Independent of the key question, an untrusted node can serve modified content. M
 
 ## 11. Data model and message schemas
 
-Every message is a signed envelope: `{payload, signer, ts, nonce, sig}`. `signer` is `node:<id>`, `resolver:<id>`, `auditor:<id>`, `account:<label>`, `operator:<pubkey>` (with a delegation attached) or `cp`. Signatures are secp256k1 over `keccak256(EIP-191 prefix ‖ signer ‖ ts ‖ nonce ‖ payload)`; verifiers look the key up in the registry cache, the account registry, or `dedan.eth`. Verifiers reject unknown signers, timestamps older than 5 min, and reused nonces. Payloads are JSON in v1 (CBOR is a serde switch when size matters).
+Every message is a signed envelope: `{payload, signer, ts, nonce, sig}`. `signer` is `node:<id>`, `resolver:<id>`, `auditor:<id>`, `account:<label>`, `operator:<pubkey>` (with a delegation attached) or `cp`. Signatures are secp256k1 over `keccak256(EIP-191 prefix ‖ signer ‖ ts ‖ nonce ‖ payload)`; verifiers look the key up in the registry cache, the account registry, or `dedan.eth`. Verifiers reject unknown signers, timestamps older than 5 min, and reused nonces. Payloads are JSON in v1 (CBOR is a serde switch when size matters) and carry integers only (throughput in kbit/s), so a verifier's JSON parser cannot change the bytes it hashes.
 
 | Message | From → To | Payload | Cadence |
 |---|---|---|---|
 | Heartbeat | Node → all resolvers | `node_id (the label), classes[], version, drain, load_mbps, connections, cpu_pct` | 10 s |
 | KeyRevealed (event) | Node signer key → `DedanRegistry` | `labelHash, hour, kHour` | Hourly, after the hour |
 | ProbeResult batch | Auditor → Aggregator | `auditor_id, period, results[]{type, node_id, account, asset, metrics{}, failure_class?, token?, ts}` | 5 min |
-| Attested (event) | Attester → `DedanRegistry.attest(batch)` | `attester, cell, labelHash, rttMs, hitTtfbMs, token, prefix (the client /24), ts = block time` | A few batches a day, opportunistic |
+| Attested (event) | Attester → `DedanCells.attest(cell, batch)` | `attester, cell, labelHash, rttMs, hitTtfbMs, token, prefix (the client /24), ts = block time`; the contract already applied the vote to its histogram | At most one batch per minute per cell |
+| Joined / Left (events) | Node owner → `DedanCells.join/leave(label, cells[])` | `cell, labelHash` | On change |
 | SubmissionReceipt | Aggregator → submitter | `batch_hash, period, ts` | Per batch |
 | CertRequest / CertIssued | Node → Control plane → Node | `node_id, account_id, hostnames[], csr` / `chain, not_after, ari_id` | Per order |
 | TxtRecord | Control plane → all resolvers (SSE) | `name, txt, expires` | Per order |
@@ -480,7 +483,8 @@ The slot assignment and the latency map are not messages: everyone computes them
 
 | Contract | State | Functions |
 |---|---|---|
-| `DedanRegistry` (ENSv2 `PermissionedRegistry`; immutable, parameters governance-settable) | ENSv2 entries per label (token, resolver, expiry, EAC version), EAC roles per resource, `nodeStake`, `nodeUnbondAt`, `nodeSuspended`, `accountStake`, `accountUnbondAt`, `accountSuspended`, `nullifierUsed{action}`, `minStake{kind}`, `worldId`, `worldIdRpId`, `dedanResolver` | `registerOperator/registerAttester(proof)`, `registerAuditor(proof, stake)`, `registerNode(label, signers, stake)`, EAC `grantRoles/revokeRoles` (signer keys), `requestUnbond/withdraw` (name), `stakeAccount/requestUnbondAccount/withdrawAccount`, `revealKey`, `attest`, governance `suspendNode/suspendAccount/slashNode/slashAccount/setMinStake/setWorldId/setDedanResolver`; ENSv2 `getOwner/getResolver/hasRoles` |
+| `DedanRegistry` (ENSv2 `PermissionedRegistry`; immutable, parameters governance-settable) | ENSv2 entries per label (token, resolver, expiry, EAC version), EAC roles per resource, `nodeStake`, `nodeUnbondAt`, `nodeSuspended`, `accountStake`, `accountUnbondAt`, `accountSuspended`, `nullifierUsed{action}`, `minStake{kind}`, `worldId`, `worldIdRpId`, `dedanResolver` | `registerOperator/registerAttester(proof)`, `registerAuditor(proof, stake)`, `registerNode(label, signers, stake)`, EAC `grantRoles/revokeRoles` (signer keys), `requestUnbond/withdraw` (name), `stakeAccount/requestUnbondAccount/withdrawAccount`, `revealKey`, `registerCell` (by `DedanCells`: the cell name with this registry as its subregistry), governance `setCells/suspendNode/suspendAccount/slashNode/slashAccount/setMinStake/setWorldId/setDedanResolver`; ENSv2 `getOwner/getResolver/hasRoles` |
+| `DedanCells` (immutable) | `members{cell → labelIds}`, `hist{cell, labelId, epoch → 32 × uint16 in two words}`, `lastVote{human, cell, labelId → epoch, bucket}`, `lastBatchAt{human, cell}`, `cellOfNode{namehash → cell}`, `aliasOf{namehash → cell, labelId}`, `BUCKET_MS = 8`, `EPOCH = 1 d`, `MIN_INTERVAL = 60 s` | `join/leave(label, cells[])` (the node owner), `attest(cell, batch)` (`ROLE_ATTESTER`, members only, one batch per minute per cell, one vote per node), views `histogram`, `median` (today + yesterday, lower-middle, bucket midpoint), `snapshot`, `membersOf`; `text` records for `<cell>.dedan.eth` (`dedan.nodes`, `dedan.latency.<label>`, `dedan.votes.<label>`, `dedan.cell`) and `<label>.<cell>.dedan.eth` (`dedan.latency`, `dedan.votes`, `dedan.cell`, `dedan.node`) |
 | Settlement (immutable; parameters governance-settable) | `accounts{id → key, balance, appliedBill, pendingWithdrawal, withdrawableAt}`, `claimed{payee}`, `roots{period → inputsHash, payoutRoot, billRoot, totals, registryBlock, priceTableVersion, publishedAt, voided}`, `totalDeposited`, `signers`, `threshold`, `priceTable{version → hash}`, `bonds{signer}`, `DISPUTE_WINDOW = 24 h`, `WITHDRAWAL_DELAY = 72 h` | `createAccount`, `deposit`, `requestWithdraw`, `cancelWithdraw`, `executeWithdraw(cumBill, proof)`, `claim(payee, cumPayout, proof)`, `publishRoot(input, sigs)` (k-of-n from the signer set, k = 2), `voidRoot`, `setSignerSet`, `setPriceTable`, `depositBond`, `slashBond`, `releaseBond` |
 
 - Merkle trees are OpenZeppelin `StandardMerkleTree`-compatible (double-hashed leaves, sorted pairs) so `MerkleProof.verify` is the on-chain verifier.
@@ -571,6 +575,15 @@ Known limits and risks:
 | Attestations submitted to the aggregator and published on IPFS; hourly map snapshot | `attest(batch)` on the registry, events only; `revealKey` on chain; the map is a pure function of the chain | The request: attest to the contract. No snapshot to trust, nothing to publish |
 | Token binds the client IP | Token binds the client /24 | An attestation on a public chain must not carry a person's address |
 
+### v3.2 (Sep 26, 2026)
+
+| v3.1 | v3.2 | Why |
+|---|---|---|
+| Attestations are events; every reader validates them (token, GeoIP, caps, one cell per day) and computes medians off chain | `DedanCells` keeps the map: nodes join resolution-2 cells, `attest(cell, batch)` is one vote per human per node per cell into per-day histograms, `median()` is the cell's record; readers mirror the same rules from the events | The request: the map as ENS records, written by the crowd in batches, one batch a minute, an efficient median. A histogram with one vote per human is exact, order-independent and cheap; a streaming estimate is neither |
+| Cells at resolution 5 (17 km), ring search to 3 | Resolution 2 (about 300 km), ring search to 2; nodes join their cells explicitly | Regions a node can join by the hundred; latency inside a cell differs by a few ms |
+| No cell names | `<cell>.dedan.eth` in `DedanRegistry` with the registry as its own subregistry: `<label>.<cell>.dedan.eth` is the node inside the cell, same token, records keyed by the full namehash | The user's "dedan → cell → node" tree without a contract per cell or a token per membership |
+| GeoIP, per-node caps and one cell per day as validity rules | On chain: membership, one batch per minute per cell, one vote per node per cell; off chain: token and GeoIP for pay and evidence only; a human may attest from any cell | The contract cannot geolocate; one vote per human bounds what a liar can do; evidence goes to governance |
+
 ## Appendix B — Attacks considered
 
 | Attack | How the design handles it |
@@ -586,8 +599,9 @@ Known limits and risks:
 | Customer sabotages its own probe assets to halve its bill | Asset validation at onboarding and hourly; all-members-fail is attributed to the origin and earns no credit |
 | Customer withdraws before the day's bill lands | 72 h withdrawal delay; bill applied first; resolvers pause service when balance minus pending withdrawal cannot cover four days |
 | Aggregator declares bills larger than customers ever deposited and pays them out | On-chain bound: cumulative bills ≤ cumulative deposits, payouts ≤ bills |
-| Attester spoofs its cell or its round trips | The fetch token binds the /24 the node saw, which must geolocate within 250 km of the cell; one cell per human per epoch; medians over k distinct humans; anchors from assigned probes clamp the crowd; evidence to governance |
+| Attester spoofs its cell or its round trips | One vote per human per node per cell, medians over k humans, so a lie moves nothing alone; the fetch token binds the /24 the node saw, which must geolocate within 250 km of the cell, or the attestation is unpaid and evidence to governance (suspension revokes the human's role) |
 | Operator mints many node names or attester accounts from one box | Each human role needs a World ID proof with a burned nullifier; each name needs its own stake and its own /24 to sit in a slot set; a name removed cannot resurrect old roles (EAC version bump) |
-| Node operator recruits humans to attest fake low round trips from many cells | Each cell needs more than half of its k humans, each with a token from the node and an IP in the area; anchors clamp the median; a set is won by coverage and a slot pays the same everywhere, so the prize is bounded |
+| Node operator recruits humans to attest fake low round trips from many cells | Each cell needs more than half of its k humans, one vote each; their tokens and networks are checked off chain and the humans are evidence; a set is won by coverage and a slot pays the same everywhere, so the prize is bounded |
+| One human posts every minute to drag a cell's median | Its newest sample is its only vote for that node in that cell; a thousand batches change nothing after the first |
 | Honest node flagged by content negotiation or an origin update; tampering only off the probe paths | Decoded-body comparison, current-or-previous digest, random asset sampling |
 | Removed node still holds a valid certificate | Bounded to 160 h; needs a hijack to receive traffic; attributable in CT; per-account operator allowlist and minimum stake |

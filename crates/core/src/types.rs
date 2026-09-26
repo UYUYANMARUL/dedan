@@ -235,7 +235,9 @@ pub struct ProbeMetrics {
     pub ttfb_ms: Option<u32>,
     pub hit_ttfb_ms: Option<u32>,
     pub rtt_ms: Option<u32>,
-    pub mbps: Option<f64>,
+    /// Single-stream throughput in kbit/s: an integer, so a signed payload never carries a float that a JSON
+    /// parser might round differently from the one that signed it.
+    pub kbps: Option<u64>,
     pub bytes: Option<u64>,
     pub sha256: Option<String>,
     pub status: Option<u16>,
@@ -284,10 +286,11 @@ pub struct Attestation {
     pub anchor: bool,
 }
 
-/// What the app assembles before one `attest` transaction.
+/// What the app assembles before one `attest` transaction: the cell it is in and its members' round trips.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct AttestationBatch {
     pub auditor_id: AuditorId,
+    pub cell: Cell,
     pub epoch: u64,
     pub attestations: Vec<Attestation>,
 }
@@ -475,6 +478,7 @@ mod tests {
 
         let batch = AttestationBatch {
             auditor_id: AuditorId(Address::from([3u8; 20])),
+            cell: Cell(0x85_1f_b4_67_ff_ff_ff_ff),
             epoch: 20_700,
             attestations: vec![Attestation {
                 cell: Cell(0x85_1f_b4_67_ff_ff_ff_ff),

@@ -1,0 +1,5 @@
+asom frankfurt 374 15
+asom tokyo 46 2
+asom seoul 26 2
+asom newyork 450 19
+asom istanbul 328 14

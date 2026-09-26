@@ -21,6 +21,7 @@ pub fn router(state: Arc<State>) -> Router {
         .route("/map", get(map))
         .route("/assignment", get(assignment))
         .route("/cell", get(cell))
+        .route("/cells", get(cells))
         .route("/set-txt", post(set_txt))
         .route("/clear-txt", post(clear_txt))
         .with_state(state)
@@ -42,7 +43,8 @@ fn fqdn(host: &str) -> String {
     format!("{}.", host.trim_end_matches('.').to_lowercase())
 }
 
-/// `GET /cell?lat=&lon=`: the H3 cell the map keys on, for scripts that add cities to the devnet.
+/// `GET /cell?lat=&lon=&k=`: the H3 cell of a point and, with `k`, the cells within `k` rings of it (the
+/// cells a node at that point joins); for the devnet scripts.
 async fn cell(
     Query(q): Query<HashMap<String, String>>,
 ) -> Result<Json<Value>, (StatusCode, String)> {
@@ -54,9 +56,41 @@ async fn cell(
     let point = dedan_core::types::LatLon::new(num("lat")?, num("lon")?);
     let cell =
         dedan_core::geo::cell(point).map_err(|e| (StatusCode::BAD_REQUEST, e.to_string()))?;
-    Ok(Json(
-        json!({ "cell": cell.0.to_string(), "lat": point.lat, "lon": point.lon }),
-    ))
+    let k: u32 = q.get("k").and_then(|v| v.parse().ok()).unwrap_or(0);
+    let cells: Vec<String> = dedan_core::geo::disk(cell, k)
+        .into_iter()
+        .map(|c| c.0.to_string())
+        .collect();
+    Ok(Json(json!({
+        "cell": cell.0.to_string(), "hex": format!("{:x}", cell.0), "lat": point.lat, "lon": point.lon, "k": k, "cells": cells,
+    })))
+}
+
+/// `GET /cells`: every cell a node joined, its members, and the contract's medians for them (votes = humans).
+async fn cells(AxState(s): AxState<Arc<State>>) -> Json<Value> {
+    let snap = s.snap.read().await;
+    let cells: Vec<Value> = snap
+        .identity
+        .members
+        .iter()
+        .map(|(cell, members)| {
+            let rank = snap.map.ranks.get(cell).filter(|r| r.rings == 0);
+            let centre = dedan_core::geo::centroid(*cell);
+            json!({
+                "cell": cell.0.to_string(),
+                "name": format!("{:x}.{}", cell.0, s.cfg.parent),
+                "centre": centre,
+                "boundary": dedan_core::geo::boundary(*cell).iter().map(|p| [p.lat, p.lon]).collect::<Vec<_>>(),
+                "members": members,
+                "humans": rank.map(|r| r.humans).unwrap_or(0),
+                "nodes": rank.map(|r| r.nodes.iter().map(|(n, ms)| json!({
+                    "label": n, "median_ms": ms,
+                    "voters": snap.map.voters.get(cell).and_then(|v| v.get(n)).cloned().unwrap_or_default(),
+                })).collect::<Vec<_>>()).unwrap_or_default(),
+            })
+        })
+        .collect();
+    Json(json!({ "block": snap.block, "cells": cells }))
 }
 
 async fn health(AxState(s): AxState<Arc<State>>) -> Json<Value> {

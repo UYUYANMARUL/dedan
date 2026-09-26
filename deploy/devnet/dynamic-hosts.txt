@@ -1,7 +1,5 @@
-paris              paris      10.77.96.1    node    48.8566 2.3522
-user-paris         paris      10.77.96.30   user    48.8566 2.3522
-asd                asd        10.77.112.1   node    24.0522 -38.2437
-user-asd           asd        10.77.112.30  user    24.0522 -38.2437
-user-berlin        berlin     10.77.1.30    user    52.52 13.405
-user-madrid        madrid     10.77.2.30    user    40.4168 -3.7038
-user-madris-close  madris-close 10.77.3.30    user    44.4168 -7.7038
+user-some          some       10.77.1.30    user    35.0 26.0
+user-somes         somes      10.77.2.30    user    35.27 127.0
+user-som           som        10.77.3.30    user    35.27 127.0
+user-asom          asom       10.77.4.30    user    33.27 127.0
+user-asoma         asoma      10.77.5.30    user    34.27 127.0

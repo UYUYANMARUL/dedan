@@ -1,10 +1,16 @@
 {
+  "_comment": "cell = the H3 resolution-2 cell of the node's location; cells = the cells the node joins (its own and the ring around it), from `cargo run -p dedan-core --example cell -- LAT LON 1`",
   "count": 5,
   "nodes": [
-    { "label": "frankfurt", "ip": "10.77.16.1", "port": 80, "class": "100M", "location": "50.1109,8.6821", "cell": "599536111567503359", "operator": 2, "hotKey": 12, "attester": 20, "user": "user-frankfurt" },
-    { "label": "tokyo", "ip": "10.77.32.1", "port": 80, "class": "100M", "location": "35.6762,139.6503", "cell": "599811782969655295", "operator": 3, "hotKey": 13, "attester": 21, "user": "user-tokyo" },
-    { "label": "seoul", "ip": "10.77.48.1", "port": 80, "class": "100M", "location": "37.5665,126.978", "cell": "599838696308473855", "operator": 4, "hotKey": 14, "attester": 22, "user": "user-seoul" },
-    { "label": "newyork", "ip": "10.77.64.1", "port": 80, "class": "100M", "location": "40.7128,-74.006", "cell": "599718752904282111", "operator": 5, "hotKey": 15, "attester": 23, "user": "user-newyork" },
-    { "label": "istanbul", "ip": "10.77.80.1", "port": 80, "class": "100M", "location": "41.0082,28.9784", "cell": "599520329710174207", "operator": 6, "hotKey": 16, "attester": 24, "user": "user-istanbul" }
+    { "label": "frankfurt", "ip": "10.77.16.1", "port": 80, "class": "100M", "location": "50.1109,8.6821", "cell": "586025403953446911", "operator": 2, "hotKey": 12, "attester": 20, "user": "user-frankfurt",
+      "cells": [586025403953446911, 586024854197633023, 586022655174377471, 586023204930191359, 585999565430194175, 586015508348796927, 586014958592983039] },
+    { "label": "tokyo", "ip": "10.77.32.1", "port": 80, "class": "100M", "location": "35.6762,139.6503", "cell": "586301381372018687", "operator": 3, "hotKey": 13, "attester": 21, "user": "user-tokyo",
+      "cells": [586301381372018687, 586300831616204799, 586280490651090943, 586285438453415935, 586284338941788159, 586300281860390911, 586299732104577023] },
+    { "label": "seoul", "ip": "10.77.48.1", "port": 80, "class": "100M", "location": "37.5665,126.978", "cell": "586328319406899199", "operator": 4, "hotKey": 14, "attester": 22, "user": "user-seoul",
+      "cells": [586328319406899199, 586314575511551999, 586329418918526975, 586326120383643647, 586328869162713087, 586336565744107519, 586315675023179775] },
+    { "label": "newyork", "ip": "10.77.64.1", "port": 80, "class": "100M", "location": "40.7128,-74.006", "cell": "586208472639471615", "operator": 5, "hotKey": 15, "attester": 23, "user": "user-newyork",
+      "cells": [586208472639471615, 586234311162724351, 586218368244121599, 586218917999935487, 586209022395285503, 586207373127843839, 586210671662727167] },
+    { "label": "istanbul", "ip": "10.77.80.1", "port": 80, "class": "100M", "location": "41.0082,28.9784", "cell": "586010010790658047", "operator": 6, "hotKey": 16, "attester": 24, "user": "user-istanbul",
+      "cells": [586010010790658047, 586009461034844159, 586011110302285823, 586583406104543231, 586263448220860415, 586262348709232639, 586012209813913599] }
   ]
 }

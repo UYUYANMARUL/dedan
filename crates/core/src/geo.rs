@@ -1,9 +1,10 @@
-//! H3 cells (ARCHITECTURE.md §6): resolution 5, about 17 km across, and the little geometry the map needs.
+//! H3 cells (ARCHITECTURE.md §6): resolution 2, about 300 km across, the regions nodes join and humans attest
+//! from, and the little geometry the map needs.
 
 use crate::types::{Cell, LatLon};
 use h3o::{CellIndex, LatLng, Resolution};
 
-pub const RESOLUTION: Resolution = Resolution::Five;
+pub const RESOLUTION: Resolution = Resolution::Two;
 
 const EARTH_RADIUS_KM: f64 = 6371.0088;
 
@@ -31,6 +32,18 @@ pub fn disk(c: Cell, k: u32) -> Vec<Cell> {
             i.grid_disk::<Vec<_>>(k)
                 .into_iter()
                 .map(|x| Cell(u64::from(x)))
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+/// The cell's outline as lat/lon vertices, for drawing it; empty for a bad index.
+pub fn boundary(c: Cell) -> Vec<LatLon> {
+    index(c)
+        .map(|i| {
+            i.boundary()
+                .iter()
+                .map(|ll| LatLon::new(ll.lat(), ll.lng()))
                 .collect()
         })
         .unwrap_or_default()
@@ -87,14 +100,24 @@ mod tests {
     use super::*;
 
     #[test]
-    fn known_points_map_to_distinct_resolution_5_cells() {
-        let ist = c(ISTANBUL);
-        let fra = c(FRANKFURT);
-        assert_ne!(ist, fra);
-        assert_eq!(CellIndex::try_from(ist.0).unwrap().resolution(), RESOLUTION);
-        // a point 2 km away lands in the same or an adjacent cell, never further
-        let near = c(LatLon::new(41.0082 + 0.018, 28.9784));
-        assert!(disk(ist, 1).contains(&near));
+    fn known_points_map_to_distinct_resolution_2_cells() {
+        let cities = [
+            ISTANBUL,
+            FRANKFURT,
+            TOKYO,
+            SEOUL,
+            NEWYORK,
+            LatLon::new(48.8566, 2.3522), // Paris
+            LatLon::new(52.52, 13.405),   // Berlin
+        ];
+        let cells: std::collections::BTreeSet<Cell> = cities.iter().map(|p| c(*p)).collect();
+        assert_eq!(cells.len(), cities.len(), "every devnet city is its own region");
+        assert_eq!(CellIndex::try_from(c(ISTANBUL).0).unwrap().resolution(), RESOLUTION);
+        // a point 20 km away lands in the same or an adjacent cell, never further
+        let near = c(LatLon::new(41.0082 + 0.18, 28.9784));
+        assert!(disk(c(ISTANBUL), 1).contains(&near));
+        // Berlin is Frankfurt's neighbour
+        assert!(disk(c(FRANKFURT), 1).contains(&c(LatLon::new(52.52, 13.405))));
     }
 
     #[test]
@@ -106,7 +129,11 @@ mod tests {
         assert_eq!(disk(ist, 0), vec![ist]);
         assert!(disk(Cell(0), 1).is_empty());
         let centre = centroid(ist).unwrap();
-        assert!(distance_km(centre, ISTANBUL) < 12.0);
+        assert!(distance_km(centre, ISTANBUL) < 200.0, "a resolution-2 cell is about 300 km across");
+        let outline = boundary(ist);
+        assert!(outline.len() >= 5 && outline.len() <= 10, "a hexagon (or a pentagon), {}", outline.len());
+        assert!(outline.iter().all(|p| distance_km(*p, centre) < 250.0));
+        assert!(boundary(Cell(0)).is_empty());
     }
 
     #[test]

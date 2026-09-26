@@ -1,15 +1,15 @@
 # Dedan — Build plan
 
-Companion to `ARCHITECTURE.md` (v3.1). Rewritten Sep 26, 2026 for the hackathon build: milestones instead of calendar phases, each ending in one `make` target that is its definition of done, and a demo storyline that grows with them.
+Companion to `ARCHITECTURE.md` (v3.2). Rewritten Sep 26, 2026 for the hackathon build: milestones instead of calendar phases, each ending in one `make` target that is its definition of done, and a demo storyline that grows with them.
 
 ## Status
 
 | Piece | State |
 |---|---|
-| Architecture v3.1 | `ARCHITECTURE.md`: crowd latency map, slot economics, ENSv2 names and Enhanced Access Control roles as the identity layer; reviewed against 15 attacks (Appendix B) |
-| Contracts | `contracts/`: `DedanRegistry.sol` (an ENSv2 `PermissionedRegistry` for `dedan.eth` with Dedan's rules: World ID-gated roles, node names as tokens, stakes, `attest` and `revealKey` as events), `DedanResolver.sol` (`addr`, `text`, DNS records, `multicall`), `DedanRoles.sol`, `LibDnsWire.sol`, `Settlement.sol`, mocks; scripts `Deploy`, `RegisterNodes`, `SetNodeIp`, `Smoke`; ENSv2 vendored from `ensdomains/contracts-v2` `post-audit-2`; 23 Foundry tests green (2026-09-26) |
-| Local devnet | `deploy/`: anvil, deployer, register-nodes, the Rust nameserver, Pebble CA, sample origin, five city nodes minting real tokens (njs) and five city users on a /16 simulated WAN; `make devnet`, `make smoke`, `make demo` pass (2026-09-26). Steering comes from attestations on the chain |
-| Rust services | `crates/core` (`dedan-core`): envelope, token, merkle, geo, map, assign, score, identity, ens; 40 unit and property tests plus two live devnet tests (`cargo test -p dedan-core -- --ignored`: event replay, ENS resolution of the five nodes). `crates/resolver` (`dedan-resolver`): the authoritative nameserver (hickory-server + axum) syncing names, records, roles, key reveals and attestations from the chain; replaced the Python mock |
+| Architecture v3.2 | `ARCHITECTURE.md`: crowd latency map kept on chain per cell (H3 resolution 2, cells as ENS names, node membership, one vote per human per node per cell, histogram medians as records), slot economics, ENSv2 names and Enhanced Access Control roles as the identity layer; reviewed against 15 attacks (Appendix B) |
+| Contracts | `contracts/`: `DedanRegistry.sol` (an ENSv2 `PermissionedRegistry` for `dedan.eth` with Dedan's rules: World ID-gated roles, node names as tokens, stakes, `revealKey`, cell names with itself as subregistry), `DedanCells.sol` (cells as names, membership, `attest(cell, batch)` with one vote per human per node per cell, per-day histograms, `median`, the cells' and alias names' text records), `DedanResolver.sol` (`addr`, `text`, DNS records, `multicall`; alias names fall through to the cells), `DedanRoles.sol`, `LibCell.sol`, `LibDnsWire.sol`, `Settlement.sol`, mocks; scripts `Deploy`, `RegisterNodes` (joins cells), `SetNodeIp`, `Smoke`; ENSv2 vendored from `ensdomains/contracts-v2` `post-audit-2`; 27 Foundry tests green (2026-09-26) |
+| Local devnet | `deploy/`: anvil, deployer, register-nodes, the Rust nameserver, Pebble CA, sample origin, five city nodes minting real tokens (njs) and five city users on a /16 simulated WAN; profiles `settlement` (city auditors, aggregator, countersigner) and `sabotage`; `make devnet`, `make smoke`, `make demo`, `make demo-settlement` pass (2026-09-26). Steering comes from attestations on the chain, money from countersigned roots |
+| Rust services | `crates/core` (`dedan-core`): envelope, token, merkle, geo, map, assign, score, identity, ens; 40 unit and property tests plus two live devnet tests (`cargo test -p dedan-core -- --ignored`: event replay, ENS resolution of the five nodes). `crates/resolver` (`dedan-resolver`): the authoritative nameserver (hickory-server + axum) syncing names, records, roles, key reveals and attestations from the chain; replaced the Python mock. `crates/auditor` (`dedan-auditor`): the auditor app (attestations on chain, scheduled probes, signed batches). `crates/aggregator` (`dedan-aggregator`): serve, countersign, recompute, report, proof, publish. `crates/core` gained `config` (deployment file, account configs, geo table, node table, keys) and `schedule` (seeded asset samples and probe slots) |
 
 ## Decisions already taken
 
@@ -20,8 +20,8 @@ Companion to `ARCHITECTURE.md` (v3.1). Rewritten Sep 26, 2026 for the hackathon 
 | TLS | Per-node keys and certificates; control plane runs ACME under Dedan's account; Let's Encrypt `shortlived` profile, `default` as the degraded-mode switch |
 | Chain | World Chain (World ID 4.0 verifier on-chain, native USDC, cent-level gas); Dedan's own ENSv2 tree on it (root → `eth` → `dedan`), bridged to canonical L1 `dedan.eth` when ENSv2 reaches mainnet; contracts immutable with governance-settable parameters |
 | Economics | Slot-based pay × audited quality (ARCHITECTURE §6, §8) |
-| Steering | Crowd-sourced latency map keyed by H3 cell, read by the resolvers; no regions; attestations are `attest` transactions on `DedanRegistry` from `ROLE_ATTESTER` holders and the map is a pure function of the chain's events |
-| Identity | ENSv2: a node is `<label>.dedan.eth`, a token in `DedanRegistry`; its endpoint and config are the name's records (`addr(60)`, `dedan.*` text, DNS A/AAAA); every permission is an Enhanced Access Control role: World ID proofs grant `ROLE_NODE_OPERATOR`, `ROLE_ATTESTER`, `ROLE_AUDITOR` on a per-human resource, owners grant `ROLE_NODE_SIGNER` on their name, governance holds the root roles; no CCIP-Read, one chain |
+| Steering | Crowd-sourced latency map keyed by H3 resolution-2 cell (about 300 km), kept by `DedanCells` on chain: nodes join cells, `ROLE_ATTESTER` holders attest a cell's members at most once a minute per cell, one vote per human per node per cell (newest sample), per-day histograms of 8 ms buckets, median over today and yesterday as the `dedan.latency` record of `<label>.<cell>.dedan.eth`; resolvers mirror it from the events (`core::map::from_votes`) |
+| Identity | ENSv2: a node is `<label>.dedan.eth`, a token in `DedanRegistry`; its endpoint and config are the name's records (`addr(60)`, `dedan.*` text, DNS A/AAAA); cells are `<h3 hex>.dedan.eth` with `DedanRegistry` as their subregistry, so `<label>.<cell>.dedan.eth` is the node inside a cell (same token, records keyed by the full namehash); every permission is an Enhanced Access Control role: World ID proofs grant `ROLE_NODE_OPERATOR`, `ROLE_ATTESTER`, `ROLE_AUDITOR` on a per-human resource, owners grant `ROLE_NODE_SIGNER` on their name, governance holds the root roles; no CCIP-Read, one chain |
 | Auditors | One app, two record types: location-tagged attestations for the map, assigned probes with tokens for quality and class |
 | Scope for v1 | classes 100M/1G (1G only when auditors can prove it), node counts 3/6/12, no pinned tier, no metered billing, no web UI, no HTTP/3, no DNSSEC, resolver operators permissioned, k = 2 countersigning, no automatic slashing |
 | Build order | Identity (contracts, core, nameserver) first because every service reads it; then the settlement loop (auditor + aggregator); then the traffic path (node, control plane) |
@@ -33,7 +33,7 @@ Companion to `ARCHITECTURE.md` (v3.1). Rewritten Sep 26, 2026 for the hackathon 
 |---|---|---|---|
 | 1 | Five World ID-verified operators own `<city>.dedan.eth` with their node's IP as an ENS record; a customer owns `images.com` and adds two CNAMEs; a verified human in each city attests round trips to every node on chain; the nameserver steers each city's client to the node the map says is closest; the Frankfurt operator changes its IP on chain and `dig` follows; a spoofed attestation is rejected; each city's user resolves `www.images.com` and fetches the asset by name: five different nodes, every body identical to the origin's, every token naming the node that owns the connected IP | `make demo` | today |
 | 2 | Round trips between the cities; what a wrong assignment would cost | `make demo` | today |
-| 3 | Five auditors probe for one 5-minute period; the Seoul node serves tampered bytes, the Tokyo node is down; the aggregator prints per-node uptime, integrity, throughput, quality and pay; the root goes on chain with two signatures; `recompute` reproduces it; after the dispute window the Istanbul operator claims USDC; the evidence file names Seoul; a spoofed attestation (wrong cell for its IP) is rejected | `make demo-settlement` | M2 |
+| 3 | The five city humans run the auditor app (staking as auditors through the World ID mock); the aggregator settles every two minutes with an independent countersigner. Seoul serves tampered bytes, Tokyo is down, a human on an Istanbul network attests from the Tokyo cell, a New York auditor fabricates results: the report shows Seoul integrity 0, Tokyo uptime 0, the three others paid, the customer credited for the undelivered nodes, the two cheats in evidence and unpaid; `recompute` reproduces the roots from the published inputs; a claim inside the dispute window fails, governance voids the root and the claim still fails after the window, the aggregator republishes, and after a new window the Frankfurt operator claims its cumulative pay with one Merkle proof | `make demo-settlement` | today |
 | 4 | Real Pingora nodes serve `https://www.images.com` with Pebble-issued certificates obtained through the control plane; the real resolver answers from the map and the public assignment; purge, stale-if-error, 421 for unknown hosts | `make e2e` | M3 |
 | 5 | The same on World Chain Sepolia with a real hostname for seven periods | testnet | M4 |
 
@@ -45,12 +45,14 @@ make smoke            # operator, node, attester and auditor registration throug
 make demo             # WAN round trips, customer DNS onboarding, key reveals and attestations on chain from every city, steering from the map, an IP change on ENS, a spoofed attestation rejected, then the routing check
 make add-node LABEL=paris LAT=48.8566 LON=2.3522   # a node and a user at a chosen location, registered on chain and attested; also POST /nodes on the dashboard
 make routing-check    # from each city's user: resolve www.images.com through the nameserver, fetch by name; passes when different nodes served byte-identical content
-make demo-settlement  # (M2) one audited 5-minute period end to end
+make demo-settlement  # fresh devnet: the settlement loop (city auditors, aggregator, countersigner) with a tampered node, a dead node, a spoofing attester and a lying auditor; report, recompute, void, claim
+make settlement-down  # stop the loop and the sabotage containers
 make e2e              # (M3) the traffic-path check
 make contracts-test   # Foundry tests in the Foundry image
 make core-test        # dedan-core unit and property tests; `cargo test -p dedan-core -- --ignored` runs the live ones
 make resolver-test    # nameserver unit tests
-make images           # build the nameserver image (cargo-chef caches the dependency build)
+make images           # build the services image: nameserver, auditor, aggregator (cargo-chef caches the dependency build)
+make workspace-test   # every crate's unit tests
 make devnet-reset     # tear down (volumes included) and start again
 ```
 
@@ -59,17 +61,21 @@ make devnet-reset     # tear down (volumes included) and start again
 | anvil | ghcr.io/foundry-rs/foundry | World Chain | http://localhost:8545, chain id 31337 |
 | deployer | same | Dedan governance deploying | one-shot; deploys `MockUSDC`, `MockWorldID`, the ENSv2 tree (`LabelStore`, root and `eth` `PermissionedRegistry`, `DedanRegistry` as `dedan`, `DedanResolver`, `UniversalResolverV2` with a stub gateway provider), `Settlement`; funds 60 accounts; writes `contracts/deployments/devnet.json` |
 | register-nodes | same | five operators and five attesters verifying with World ID and registering | one-shot (`deploy/scripts/register-nodes.sh` runs `RegisterNodes.s.sol` over `deploy/devnet/nodes.json`): `registerOperator`, `registerNode(<city>, [hotKey], 1000 USDC)`, records through `DedanResolver.multicall` (payout, class, location, port, enckey, version, DNS A), `registerAttester` |
-| resolver | `dedan-resolver:local` (`crates/resolver`, Rust) | Dedan resolvers (steering `<account>.dedan-cdn.test` from the chain's map and the assignment, `<label>.node.dedan-cdn.test` from the ENS DNS records, `_acme-challenge` TXT) and the customers' DNS providers (`deploy/resolver/zones/*.zone`) | `dig -p 15353 @127.0.0.1`, WAN 10.77.0.53 (undelayed), management API :8055 (`/health`, `/nodes`, `/map`, `/assignment`, `/set-txt`, `/clear-txt`) |
+| resolver | `dedan-services:local` (`crates/Dockerfile`: every Rust binary; `crates/resolver`) | Dedan resolvers (steering `<account>.dedan-cdn.test` from the chain's map and the assignment, `<label>.node.dedan-cdn.test` from the ENS DNS records, `_acme-challenge` TXT) and the customers' DNS providers (`deploy/resolver/zones/*.zone`) | `dig -p 15353 @127.0.0.1`, WAN 10.77.0.53 (undelayed), management API :8055 (`/health`, `/nodes`, `/map`, `/assignment`, `/set-txt`, `/clear-txt`) |
 | pebble | ghcr.io/letsencrypt/pebble | Let's Encrypt (`default` and `shortlived`) | https://localhost:14000/dir |
 | origin | `dedan-wan:local` | a customer origin with an asset manifest and blobs, in New York | http://localhost:8080, WAN 10.77.64.20 |
 | frankfurt, tokyo, seoul, newyork, istanbul | `dedan-wan:local` | CDN nodes: nginx `proxy_cache`, real `X-Dedan-Node` tokens minted by njs from `keys.json`, `/.well-known/dedan/blob/<n>`; replaced by the Pingora node in M3 | http://localhost:8011–8015, WAN 10.77.16.1, .32.1, .48.1, .64.1, .80.1 (one /20 per city) |
 | user-\<city\> | `dedan-wan:local` | a human in each city: attester for the map (anvil keys 20–24), end user for fetches; DNS goes to the nameserver | WAN 10.77.<16c>.30 |
 | user-\<label\> (client added while running) | `dedan-wan:local`, plain `docker run` with label `dedan.dynamic` | `make add-client LABEL=berlin LAT=52.52 LON=13.405` or the dashboard: a human's device at a chosen location in its own /24 (10.77.<n>.0/24, n = 1..15; the address is what tells the nameserver where it is), round trips to every node from great-circle distance ±20 % with per-packet jitter, DNS to the nameserver; its human (anvil key 45+n) starts unverified: `human.sh` (World ID mock) grants `ROLE_ATTESTER`, then `attest.sh` submits metrics | WAN 10.77.<n>.30 |
 | \<label\>, user-\<label\> (added while running) | `dedan-wan:local`, plain `docker run` with label `dedan.dynamic` | `make add-node LABEL=paris LAT=48.8566 LON=2.3522` or the dashboard: a node and a user at a chosen location, /20 number 6 onward, WAN delays from great-circle distance (5 ms + 20 ms per 1000 km, carried by the new containers' side), keys anvil 30+ (three per city), registered and attested on chain; listed in `deploy/devnet/dynamic-hosts.txt`, which the nameserver re-reads; removed by `make devnet-down` | WAN 10.77.<16n>.1 and .30 |
-| dashboard | `dedan-dashboard:local` (`deploy/dashboard`, stdlib Python + docker CLI) | a demo console: nodes from ENS, the map, container logs, a terminal link per container, `POST /nodes {label, lat, lon}` (runs `deploy/scripts/add-node.sh`), and a client's attestation flow: `POST /api/worldid {city, index?}` verifies a human through the World ID mock and grants `ROLE_ATTESTER` (`human.sh`), `POST /api/attest {city, index?, nodes?}` measures the nodes from that city's user container and sends the batch to `attest` (`attest.sh`); an unverified key is rejected by the contract | http://localhost:9090 |
+| dashboard | `dedan-dashboard:local` (`deploy/dashboard`, stdlib Python + docker CLI) | a demo console: nodes from ENS, a world map of the cells with their members, medians and voters (Leaflet, OpenStreetMap tiles from the internet), the map table, container logs, a terminal link per container, `POST /nodes {label, lat, lon}` (runs `deploy/scripts/add-node.sh`), and a client's attestation flow: `POST /api/worldid {city, index?}` verifies a human through the World ID mock and grants `ROLE_ATTESTER` (`human.sh`), `POST /api/attest {city, index?, nodes?}` measures the nodes from that city's user container and sends the batch to `attest` (`attest.sh`); an unverified key is rejected by the contract | http://localhost:9090 |
 | dozzle | amir20/dozzle | per-container logs and a browser terminal into any container (`DOZZLE_ENABLE_SHELL`) | http://localhost:9999 |
 | lego (profile `smoke`) | goacme/lego | a node obtaining its certificate | one-shot |
-| kubo (profile `full`) | ipfs/kubo | published settlement inputs (M2) | http://localhost:5001 |
+| auditor-\<city\> (profile `settlement`) | `dedan-services:local` (`crates/auditor`) | the city's human running the auditor app (the same key as its attester, 20–24, now staked as an auditor): attestations to the registry from its cell, the schedule's landing and targeted probes on `www.images.com`, signed batches to the aggregator; WAN delays like the city's user, DNS at the nameserver | WAN 10.77.<16c>.31 |
+| aggregator (profile `settlement`) | `dedan-services:local` (`crates/aggregator`, key 8) | the aggregator: batches in, every `DEDAN_PERIOD_SECS` (120) the period's `inputs/` and `outputs/` on the `settlement-data` volume, countersignature, `publishRoot` | http://localhost:8060 (`/health`, `/periods`, `POST /v1/probe-results`) |
+| countersigner (profile `settlement`) | same image, key 9 | the independent countersigner: recomputes each period from the shared inputs and checks them against the chain before signing | http://localhost:8061 (`POST /countersign`) |
+| auditor-spoof, auditor-liar, origin-tampered (profile `sabotage`) | same images, keys 25 and 26 | `make demo-settlement`'s bad actors: a human on an Istanbul network attesting from the Tokyo cell (attests only), an auditor that never fetches and forges tokens, the real origin's files with a byte appended (Seoul is pointed at it) | WAN 10.77.80.32, 10.77.64.32, 10.77.64.21 |
+| kubo (profile `full`) | ipfs/kubo | published settlement inputs once they leave the shared volume | http://localhost:5001 |
 
 **Simulated WAN.** `deploy/wan/hosts.txt` (name, city, ip, role, lat, lon) is the one source: 10.77.0.0/16, one /20 per city (`10.77.<16c>.0/20`), each node its own /24 inside it, origin and users inside their city's /20; `wan.sh` sets one `tc netem` band per city from `latency.txt`. Measured 2026-09-26 from Istanbul: CSS hit 10 ms local, 99 ms Frankfurt, 283 ms New York, 572 ms Tokyo.
 
@@ -79,7 +85,7 @@ make devnet-reset     # tear down (volumes included) and start again
 
 **Devnet inputs that replace unbuilt services.** Until M3: `deploy/devnet/nodes.json` (label, ip, port, class, location, cell, operator/hotKey/attester key index, user container), `deploy/devnet/accounts.json` (label, hostnames, node count, class, availability), `deploy/devnet/keys.json` (the static hourly key the mock nodes mint with and reveal on chain). The nameserver reads `accounts.json` until the control plane exists; everything about nodes comes from the chain.
 
-What the mocks replace: `MockUSDC` for USDC; `MockWorldID` (any proof with a non-zero nullifier) for the World ID verifier; the zone files for the customers' DNS providers; Pebble for the CA; nginx for the nodes; `StubGatewayProvider` (no gateways) for the Universal Resolver's CCIP-Read. Actor roles by anvil account index: 0 governance, 1 customer, 2–6 city operators, 7 smoke operator, 8 aggregator, 9 countersigner, 12–16 city hot keys, 17 smoke hot key, 20–24 city attesters, 25 smoke attester, 26 smoke auditor, 30+ the cities added at runtime (operator, hot key, attester per city).
+What the mocks replace: `MockUSDC` for USDC; `MockWorldID` (any proof with a non-zero nullifier) for the World ID verifier; the zone files for the customers' DNS providers; Pebble for the CA; nginx for the nodes; `StubGatewayProvider` (no gateways) for the Universal Resolver's CCIP-Read. Actor roles by anvil account index: 0 governance, 1 customer, 2–6 city operators, 7 smoke operator, 8 aggregator, 9 countersigner, 12–16 city hot keys, 17 smoke hot key, 20–24 city attesters, 25 smoke attester (and the settlement demo's spoofing attester), 26 smoke auditor (and its lying auditor; the two demos run on separate fresh chains), 30+ the cities added at runtime (operator, hot key, attester per city).
 
 The smoke: stage 1 registers an operator (World ID mock) and the node `smoke.dedan.eth` with a hot key and records, an attester attests, an auditor stakes, the hot key reveals a token key, the Universal Resolver resolves `dedan.class`, the operator rewrites the node's A record and nobody else can; then one settlement day (roots, +73 h, stage 2 claims); lego certificate for `www.images.com` + `istanbul.node.dedan-cdn.test` through the nameserver's TXT API; origin fetch.
 
@@ -117,13 +123,25 @@ Notes from building the crate: envelopes sign `keccak256(signer ‖ 0x00 ‖ ts 
 
 Check (green 2026-09-26): `make contracts-test` (23), `make core-test` (40) and the two live tests, `make devnet-reset && make smoke && make demo`.
 
-### M2 — Settlement loop on the mocks (`make demo-settlement`)
-- Done in M1b: the mock nodes mint real tokens through nginx `njs` from `keys.json` and serve `/.well-known/dedan/blob/<n>`.
-- Auditor (`crates/auditor`): opportunistic attestations to every reachable node from its cell, sent as `attest` batches to `DedanRegistry`; assigned probes from `core::assign` over `nodes.json` + `accounts.json` + registry (landing, targeted with token, per-stream throughput, class probe, resolver conformance), flagged `anchor` for the map; `wreq` with a Chrome profile; signed batches every 5 min; receipts. One container per city on the WAN.
-- Aggregator (`crates/aggregator`): `axum` ingest (`/v1/probe-results`, `/v1/asset-samples`; attestations and key reveals come from the chain) with envelope verification against the identity cache; SQLite per period; `origin-digest` subcommand; at period close the inputs directory (below), `core::score`, outputs and evidence, publish (kubo or `--inputs-dir`), countersignature, `publishRoot`; `--period 5m`; `countersign` and `recompute` modes.
-- Demo script: Seoul pointed at `origin-tampered`, Tokyo stopped, one attester started with a spoofed cell, one auditor with `--devnet-lie`; table, evidence, transaction, recompute, time jump, claim.
+### M2 — Settlement loop on the mocks (`make demo-settlement`): done (Sep 26, 2026)
+- Auditor (`crates/auditor`, `dedan-auditor`): one process per human. At start it grants itself `ROLE_ATTESTER` (World ID proof) and `ROLE_AUDITOR` (proof plus the minimum stake, approved and pulled from its USDC) if it lacks them. Every `DEDAN_SYNC_SECS` it replays the registry, reads the names' records through the Universal Resolver, rebuilds the map and the assignment with `dedan-core` and samples each account's asset list with the day's seed (`core::schedule`). From its `DEDAN_LOCATION` cell it measures every reachable node (the shortest of three TCP connects, two fetches with the customer hostname for the token and the cache-hit TTFB) and sends one `attest` batch, at most `per_node_cap` per node per epoch counting what the chain already holds from its key. Per account it runs the schedule's slots (`core::schedule::slot`: landing probes through its own resolver alternating with targeted probes to each member in turn, exponential waits with mean `DEDAN_PROBE_MEAN_SECS`), records status, TTFB, cache-hit TTFB, TCP RTT, decoded sha256, bytes, Mbps and the node's token, and ships signed `ProbeBatch` envelopes every `DEDAN_BATCH_SECS`, keeping them for the next try when the aggregator's receipt is missing or not its. `DEDAN_DEVNET_LIE=1` fabricates every result and token; `DEDAN_PROBES=0` attests only.
+- Aggregator (`crates/aggregator`, `dedan-aggregator serve`): `POST /v1/probe-results` verifies the envelope against the identity cache (clock window, `auditor:<addr>` holding the role and the stake, replay) and appends it to `data/inbox/<wall period>.jsonl`, answering a receipt signed by the aggregator key. At every period close (`DEDAN_PERIOD_SECS` + `DEDAN_GRACE_SECS`) it writes `inputs/` (below) for contract period `lastPeriod + 1`, runs `settle::compute` (identity folded from the events, envelope verification, tokens against the reveals, map, assignment sticky on the previous outputs, `core::score`, leaves with proofs, the digest the contract signs), writes `outputs/`, signs, asks the countersigner and calls `publishRoot`. A voided predecessor is republished from disk first; `publish DIR` does the same by hand. `GET /periods` lists what it published.
+- Countersigner (`dedan-aggregator countersign`, a second container with its own key): `POST /countersign {dir}` reads the inputs from the shared volume, recomputes, compares roots, totals and digest, fetches the registry's events itself up to `registry_block` and compares them with the inputs', checks the period number against the contract and the contract's own `digest()`, and only then signs.
+- Offline modes for anyone with the directory: `recompute DIR` (reproduce and compare, exit 1 on a difference), `report DIR` (the period in plain text), `proof DIR PAYEE` (cumulative amount and Merkle proof for `claim`).
+- Devnet: compose profile `settlement` (five `auditor-<city>`, `aggregator`, `countersigner`, volume `settlement-data`) and profile `sabotage` (`auditor-spoof`, `auditor-liar`, `origin-tampered`); `accounts.json` gained `origin`, `asset_list` and `price_usdc_per_day` (7,200: a day compressed into two-minute periods bills 10 USDC each); `deploy/scripts/demo-settlement.sh` funds the account, reveals every node's key for this hour and the next, starts the loop, sabotages (Seoul's `proxy_pass` to `origin-tampered` with its cache purged, Tokyo stopped, the two bad humans), waits for the first full period after that, prints the report, recomputes on the countersigner, checks the outcome, walks through the claim, the void, the republish and the final claim, then undoes the sabotage and leaves the loop running.
 
-Check: Seoul integrity 0, Tokyo uptime 0, three others paid; the spoofed attestation and the lying auditor appear in evidence and are unpaid; `recompute` reproduces the root; the claim succeeds; `voidRoot` inside the window blocks a claim.
+Deviations from the sketch above, on purpose: `reqwest` in place of `wreq` (the browser fingerprint is an M4 hardening item; nothing on the devnet inspects TLS); JSONL files instead of SQLite (the inbox already is the inputs format); no `/v1/asset-samples` endpoint (the aggregator digests the origin itself until the control plane exists; the digests are inputs either way); inputs on a shared volume rather than kubo; the day's seed is `keccak256(day)` (the assignment's) rather than an L1 block hash; the scorer does not check that a probe was on schedule; an attempt at a period number that never published is overwritten by the next attempt. Not built yet: class probes (`/.well-known/dedan/blob/50`), resolver-conformance probes (no `ROLE_RESOLVER_OPERATOR` holder exists on the devnet, so the resolver pool's share goes to the protocol fee), entry audits, and the `anchor` flag on attestations made during assigned probes.
+
+Check (green 2026-09-26, `make devnet-reset && make demo-settlement`): Seoul integrity 0 (mismatch on `/assets/blob-16m.bin` seen by two auditors), Tokyo uptime 0 (9 connect failures), Frankfurt, New York and Istanbul paid 1.63 USDC each of a 9.78 USDC pool, acme billed 8.33 of 10 USDC for 4 of 6 nodes delivered; the spoofing attester (`OutOfArea`, 8,939 km) and the lying auditor (17 `invalid_token` results, `BadToken` attestations) in evidence and unpaid, the five honest auditors paid; `recompute` on the countersigner reproduces the roots; a claim inside the window fails (`NoFinalRoot`), governance voids the period, the claim still fails after the window, the aggregator republishes, and after a new window the Frankfurt operator claims 4.08 USDC with one proof.
+
+### M2b — Cells on chain (v3.2): done (Sep 26, 2026)
+Requested after M2: the map as ENS records under cells, nodes assigning themselves to cells, one batch per human per cell per minute, an efficient on-chain median. Argued and decided (2026-09-26): a bucketed histogram with one vote per human per node per cell instead of a streaming estimate (exact, order-independent, sybil-fair); resolution 2 cells; nested alias names through a self-referencing subregistry instead of a contract per cell; no token check on chain in v1 (tokens stay in the event for pay and evidence); a human may attest from any cell (a traveller).
+- Contracts: `DedanCells` (join/leave, `attest(cell, batch)`, `histogram`, `median`, `snapshot`, `text` records for cells and aliases, ERC-1155 receiver for the cell names), `DedanRegistry.registerCell` (subregistry = itself), the label guard, `DedanResolver` fallthrough for alias names, `LibCell`; `RegisterNodes` joins each node to its cell and ring 1 from `nodes.json` `cells`; the smoke joins and attests through the cells and reads `smoke.821ecffffffffff.dedan.eth`'s `dedan.latency` through the Universal Resolver.
+- Core: `geo::RESOLUTION = Two`; `identity` replays both contracts, keeps `members` and the head block's time; `map::from_votes` mirrors the contract (`histogram_median`); the `Validator` keeps only the token and location checks (per-node caps and one-cell-per-day are gone); `AttestationBatch` is per cell.
+- Services: the nameserver's map comes from votes on the chain's clock, `/cell?k=` and `/cells`; the auditor attests its own cell's members once a minute; the aggregator's inputs carry `chain_time` and its map is the mirror.
+- Devnet: `nodes.json` cells and `cells`, `add-node.sh` joins, `attest_from` per cell, `demo.sh` shows `/cells`, the spoofed vote and the ENS reads; the settlement demo's spoofer claims Seoul's cell (Tokyo's has no reachable member while Tokyo is stopped). The dashboard has a world map (Leaflet over OpenStreetMap tiles, cell outlines from `/cells` `boundary`, coloured by best median; click a cell for its name, members, medians and the votes behind them with the attester's key, sample and time; click a node for the cells it joined; `#cell=<id>` / `#node=<label>` preselect) plus a Cells table, and attests a client's cell members only.
+
+Check (green 2026-09-26): `make contracts-test` (27, `DedanCells.t.sol` walks `fra.<cell>.dedan.eth` through the Universal Resolver), `make core-test` (46), `make devnet-reset && make demo-settlement` (all seven checks on the first scored period; the spoofer's votes are `out_of_area` from 7,944 km), `make devnet-reset && make smoke && make demo`: five nodes in 35 cells, each city's human attesting its cell, the spoofed Istanbul vote counted once in Tokyo's cell and named `out_of_area`, `frankfurt.821faffffffffff.dedan.eth`'s `dedan.latency` read through the Universal Resolver from the shell, steering per city unchanged, `CDN ROUTING OK`. The live test `mirror_matches_the_contract_medians` (`cargo test -p dedan-core -- --ignored`) compares the readers' map with `DedanCells.median` on the devnet.
 
 ### M3 — Traffic path (`make e2e`)
 - Control plane (`crates/cp`): as before (accounts, domains with CNAME and CAA checks, signed configs, delegations, purge, SSE, asset samples, ACME runner with profile switch, TXT records). Tier = node count, class, availability target.
@@ -140,20 +158,29 @@ As before: PSL and Let's Encrypt override (start at M2), CAA guidance, EAB CA sw
 
 ```
 inputs/
-  manifest.json           period, bounds, registry_block, price_table_version, config_versions, prev_outputs_hash, score_version, files{name: sha256}
-  probe-results.jsonl     accepted ProbeResult envelopes, sorted by (auditor_id, ts, hash)
-  attestations.jsonl      accepted Attested events of the window, sorted by (block, log index)
-  key-reveals.jsonl       KeyRevealed events
-  asset-samples.jsonl     AssetSample + OriginDigest envelopes
-  configs.jsonl           AccountConfig versions in force (accounts.json on the devnet until M3)
+  manifest.json           period (the contract's number), wall period and bounds, registry_block, chain id, Settlement and
+                          governance (treasury) addresses, price_table_version, score_version, period_secs, sample_n, map_k,
+                          prev_outputs_hash, files{name: sha256}
+  registry-events.jsonl   every decoded DedanRegistry event from block 0 to registry_block, in chain order: roles, names,
+                          stakes, suspensions, key reveals, attestations
+  probe-results.jsonl     the ProbeBatch envelopes filed in the wall period, sorted by (signer, ts, hash); verified again
+                          in compute, rejected ones listed in outputs/rejected-batches.json and counted for nothing
+  asset-samples.jsonl     AssetSample per account: the day's sampled assets with sha256 current and previous, size, etag
+                          (digested from the origin by the aggregator; signed by the control plane from M3)
+  configs.jsonl           AccountCfg rows (accounts.json until M3)
+  nodes.json              the names' records at close: payout, ipv4, port, class, location
+  geo.json                prefix -> point (the host tables; a GeoIP database version in production)
+  prev.json               the previous period's cumulative leaves, slot sets and member quality
 outputs/
-  map.json                cell → ranked nodes with medians and human counts; node location estimates
-  assignment.json         slot sets (sticky on prev_outputs)
-  quality.json            per (node, account): uptime, integrity, throughput, quality, valid probes
-  multipliers.json        per account: s_dim, mult, credit
-  payout-leaves.json, bill-leaves.json
-  evidence.json           mismatches, invalid tokens, outliers, spoofed attestations, anchor disagreements
-  roots.json              payout_root, bill_root, totals, digest, signatures
+  map.json                covered cells, ranked nodes with medians and human counts, node location estimates, anchor
+                          disagreements, this period's rejected attestations
+  assignment.json         slot sets (sticky on prev.json)
+  score.json              core::score's whole output: quality per (account, node), multipliers, payouts, auditor pay,
+                          protocol fee, cumulative leaves, class qualification, evidence
+  evidence.json           mismatches, invalid tokens, outliers, unmeasured members, spoofed attestations
+  payout-leaves.json      (payee, cumulative, proof); bill-leaves.json the same per account
+  next.json               prev.json of the next period
+  roots.json              RootInput, digest, signatures, publishRoot transaction
 ```
 `inputs_hash = sha256(manifest.json)`. `recompute` reproduces `outputs/` byte for byte. Anything not in `inputs/` cannot influence money or the map.
 
@@ -175,16 +202,21 @@ outputs/
 - Browsers fall back on RST immediately, 20–30 s on a silent drop.
 - GeoIP: DB-IP Lite may ship in images; GeoLite2 needs per-operator keys.
 - Docker Desktop: `tc netem` works with `CAP_NET_ADMIN`; embedded DNS forwards to a container's `dns:` server with the container's source IP; host port 5353/udp belongs to mDNSResponder.
-- `h3o` 0.11 (the five cities' resolution-5 cells are in `nodes.json`); `nginx:alpine` ships njs with `require('crypto')` HMAC (`deploy/wan/dedan.js`).
+- `reqwest` 0.13 (already in the lockfile as alloy's HTTP transport): features `default-tls = rustls`, `json`; `ClientBuilder::resolve(host, addr)` pins a hostname to a node; hyper-util's connector tries the next resolved address after a connect failure or timeout, so a landing fetch survives a dead first A record (about `connect_timeout` later).
+- `alloy-signer-local` 2.5 feature `mnemonic`: `MnemonicBuilder::<English>::default().phrase(m).index(i)?.build()?`; `ProviderBuilder::new().wallet(signer).connect_http(url).erased()` gives the `DynProvider` that `sol!(rpc)` instances take; `.call().await?` returns the single value directly, `.send().await?.get_receipt().await?` the receipt.
+- The Settlement digest recomputed off-chain: `keccak256(abi.encode(chainid, settlement, period, inputsHash, registryBlock, priceTableVersion, payoutRoot, billRoot, totalCumPayout, totalCumBill))` = `SolValue::abi_encode` of the tuple; signatures are EIP-191 over the 32-byte digest (`sign_message_sync`), 65 bytes r‖s‖v, as `ECDSA.recover(toEthSignedMessageHash(d), sig)` expects.
+- `serde_json` parses floats best-effort unless its `float_roundtrip` feature is on, so a signed payload carrying an `f64` can re-canonicalise to different bytes on the verifier and recover another address (the auditors' first batches failed exactly this way). Signed payloads carry integers only: throughput is `kbps: u64`. `envelope::tests::probe_batch_envelope_survives_the_wire` guards it.
+- ENSv2 aliasing: a registry may be the subregistry of any number of labels, including one of its own (`register(<cell>, ..., subregistry = this)`); the Universal Resolver's walk hands each level only the next label and calls the deepest resolver with the full name's namehash, so `<label>.<cell>.dedan.eth` reaches `DedanResolver` with a namehash it never bound; records keyed by that namehash are the per-cell ones. A name minted to a contract needs `IERC1155Receiver`. `ILabelStore.getLabel(anyId)` inverts label ids. (2026-09-26)
+- `h3o` 0.11 (the five cities' resolution-2 cells and ring-1 disks are in `nodes.json`; `cargo run -p dedan-core --example cell -- LAT LON [k]`); `nginx:alpine` ships njs with `require('crypto')` HMAC (`deploy/wan/dedan.js`).
 
 ## Workspace layout
 
 ```
 ARCHITECTURE.md, PLAN.md
-Makefile                   devnet, devnet-reset, smoke, demo, images, contracts-test, core-test, resolver-test, deps; demo-settlement (M2), e2e (M3)
+Makefile                   devnet, devnet-reset, smoke, demo, routing-check, add-node, add-client, demo-settlement, settlement-down, images, contracts-test, core-test, resolver-test, workspace-test, deps; e2e (M3)
 contracts/                 Foundry project: src/ (DedanRegistry, DedanResolver, DedanRoles, LibDnsWire, Settlement, mocks), script/ (Deploy, RegisterNodes, SetNodeIp, Smoke), test/, lib/contracts-v2 (vendored ENSv2), deployments/
 deploy/                    docker-compose.yml, resolver/zones (customer zone files), wan/ (hosts.txt, dedan.js, node template), pebble/, lego/, origin/, scripts/, devnet/ (nodes, accounts, keys)
-crates/                    core, resolver; (M2) auditor, aggregator; (M3) node, cp
+crates/                    Dockerfile (one image, three binaries), core, resolver, auditor, aggregator; (M3) node, cp
 ```
 
 `core::map`, `core::assign` and `core::score` are the same code in the resolvers, the auditors, the aggregator, the countersigner and `recompute`. That is what makes the map, the sets and the money public.
@@ -193,21 +225,22 @@ crates/                    core, resolver; (M2) auditor, aggregator; (M3) node, 
 
 | Parameter | v1 | Where |
 |---|---|---|
-| Cell resolution | H3 5 (about 17 km across) | core geo |
+| Cell resolution | H3 2 (about 300 km across): membership, attestation and steering | core geo, `DedanCells` |
 | Coverage k | 3 minimum, 5 target distinct humans per cell (1 on the devnet) | core map |
 | Ring search | up to 3 rings | core map |
-| Map window | 48 h of `Attested` events | core map |
-| Epoch | 24 h; one cell per human per epoch | core map |
-| Attestation validity | token from the node; the client /24 within 250 km of the cell; ≤ 3 per human per node per epoch; ≤ 50 per human per epoch for pay | core map |
-| Anchor clamp | crowd median within ± 50 ms of the anchor median | core map |
+| Map window | today's and yesterday's histograms | `DedanCells.median`, core map |
+| Epoch | 24 h (the histogram day); a human may attest from any number of cells | `DedanCells`, core map |
+| Attestation rules | on chain: `ROLE_ATTESTER`, the node joined the cell, one batch per human per cell per 60 s, one vote per human per node per cell (newest sample), 32 buckets × 8 ms, window today + yesterday; off chain for pay and evidence: token from the node, the client /24 within 250 km of the cell, ≤ 50 attestations per human per epoch paid | `DedanCells`, core map |
+| Anchor clamp | crowd median within ± 50 ms of the anchor median (evidence path only; the on-chain median has no privileged rows) | core map |
 | Steering tie window | 20 ms, broken by spare capacity | resolver |
 | Node count tiers S | 3, 6, 12 | price table |
 | Admission factor k | 3 | core assignment |
 | Sticky quality threshold | 0.9; rotation ≤ 1 per set per day, only for > 10% improvement | core assignment |
 | Inconclusive class | eligible at the highest conclusive class, 100M when none | core score |
-| Assigned probe interval | Poisson, mean 3 min per auditor per account | auditor |
+| Assigned probe interval | Poisson, mean 3 min per auditor per account (5 s on the devnet, `DEDAN_PROBE_MEAN_SECS`) | auditor |
+| Settlement period | daily (120 s on the devnet, `DEDAN_PERIOD_SECS`, grace 10 s); asset sample 4 per account per day | aggregator, auditor |
 | Auditors per target | min 3, target 5 | schedule |
-| Auditor client profile | `wreq` Chrome | auditor |
+| Auditor client profile | `wreq` Chrome (M4; `reqwest` until then) | auditor |
 | Per-stream throughput floor | 25 Mbps | aggregator |
 | Integrity confirmation | 2 auditors + 1 other member served matching bytes | aggregator |
 | SLA floor | 0.5 | aggregator |
@@ -226,7 +259,8 @@ crates/                    core, resolver; (M2) auditor, aggregator; (M3) node, 
 | Period clock vs chain clock | wall-time periods; anvil advanced only for the dispute window |
 | `tc` has seven bands per host | per-city bands from the M1 growth |
 | k = 1 on the devnet hides collusion cases | the `core::map` fixtures cover them; the demo shows the spoofed-cell rejection, which does not need k |
-| Mock tokens vs real tokens | `keys.json` disappears at M3; `make demo-settlement` passes in both |
+| Mock tokens vs real tokens | `keys.json` disappears at M3; `make demo-settlement` passes in both. The demo reveals every node's key for this hour and the next before starting, since tokens verify only against revealed keys |
+| Assignment stickiness state is not shared | the nameserver and each auditor compute the day's sets without a previous period (identical on day one); the aggregator's are sticky on its own outputs. With S ≥ node count (the devnet's 6 over 5) they coincide; a probe to a non-member is ignored by the scorer, a member nobody probed shows as `unmeasured` |
 | Attester gas on World Chain | each attester key holds a little ETH on the devnet; a paymaster is an M4 item |
 | EAC's 15 holders per role per resource | population roles live on per-human resources; a node hands out at most 15 signer keys |
 | `<label>.dedan.eth` is not a canonical `.eth` name yet | the tree mirrors ENS; bridging canonical `dedan.eth` to this registry is a pointer, not a rename |
@@ -235,7 +269,8 @@ crates/                    core, resolver; (M2) auditor, aggregator; (M3) node, 
 
 - Today: `make devnet` + `make smoke` + `make demo`.
 - M1/M1b: `make contracts-test`, `make core-test`, `cargo test -p dedan-core -- --ignored` against the devnet, `make devnet-reset && make smoke && make demo` (green, 2026-09-26).
-- M2: `make demo-settlement`.
+- M2: `make devnet-reset && make demo-settlement` (green, 2026-09-26; the settlement loop keeps running afterwards, `make settlement-down` stops it). Do not run it after `make smoke` on the same chain: the smoke publishes period 1 by hand.
+- M2b: the M1b line plus `cargo test -p dedan-core -- --ignored` on a devnet with votes (green, 2026-09-26).
 - M3: `make e2e`, then `make demo` and `make demo-settlement` with the real node.
 - Contracts: `make contracts-test`. Workspace: `cargo test --workspace`.
 - No step is done until its check runs green on the devnet.

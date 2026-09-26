@@ -212,6 +212,59 @@ mod tests {
         );
     }
 
+    /// What the aggregator does: parse the envelope's JSON text, then recover the signer from the re-canonicalised
+    /// payload. Every field of a probe result must survive that round trip byte for byte.
+    #[test]
+    fn probe_batch_envelope_survives_the_wire() {
+        use crate::types::*;
+        let k = key();
+        let batch = ProbeBatch {
+            auditor_id: AuditorId(k.address()),
+            period: 7,
+            results: vec![
+                ProbeResult {
+                    probe: ProbeType::Targeted,
+                    account: AccountId::new("acme"),
+                    asset: "/images/photo-1.png".into(),
+                    target: Some(NodeId::new("seoul")),
+                    node_id: Some(NodeId::new("seoul")),
+                    ok: true,
+                    failure: None,
+                    metrics: ProbeMetrics {
+                        ttfb_ms: Some(586),
+                        hit_ttfb_ms: Some(251),
+                        rtt_ms: Some(250),
+                        kbps: Some(1_234_567),
+                        bytes: Some(21_733),
+                        sha256: Some("ab".repeat(32)),
+                        status: Some(200),
+                    },
+                    token: Some(format!("seoul.29840419.{}", "0".repeat(64))),
+                    prefix: "10.77.16.0/24".into(),
+                    ts: 1_790_425_100,
+                },
+                ProbeResult {
+                    probe: ProbeType::Landing,
+                    account: AccountId::new("acme"),
+                    asset: "/".into(),
+                    target: None,
+                    node_id: None,
+                    ok: false,
+                    failure: Some(FailureClass::Connect),
+                    metrics: ProbeMetrics::default(),
+                    token: None,
+                    prefix: "10.77.16.0/24".into(),
+                    ts: 1_790_425_101,
+                },
+            ],
+        };
+        let env = Envelope::sign(batch, format!("auditor:{}", k.address()), 1_790_425_110, 3, &k).unwrap();
+        let text = serde_json::to_string(&env).unwrap();
+        let back: Envelope<ProbeBatch> = serde_json::from_str(&text).unwrap();
+        assert_eq!(back.recover().unwrap(), k.address());
+        assert_eq!(back.hash().unwrap(), env.hash().unwrap());
+    }
+
     #[test]
     fn canonical_json_sorts_keys_and_strips_whitespace() {
         let v = serde_json::json!({"b": 1, "a": {"d": [1, 2], "c": null}});

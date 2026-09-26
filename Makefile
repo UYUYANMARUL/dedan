@@ -5,7 +5,7 @@ FORGE := docker run --rm -v $(CURDIR)/contracts:/work -v dedan-foundry-home:/hom
 NODES := frankfurt tokyo seoul newyork istanbul
 USERS := user-frankfurt user-tokyo user-seoul user-newyork user-istanbul
 
-.PHONY: help deps contracts-build contracts-test core-test resolver-test images devnet devnet-down devnet-reset smoke demo routing-check add-node add-client
+.PHONY: help deps contracts-build contracts-test core-test resolver-test workspace-test images devnet devnet-down devnet-reset smoke demo routing-check add-node add-client demo-settlement settlement-down
 
 help: ## list targets
 	@grep -E '^[a-z-]+:.*##' $(MAKEFILE_LIST) | sed 's/:.*## / - /'
@@ -25,7 +25,10 @@ core-test: ## unit and property tests of crates/core (add `-- --ignored` by hand
 resolver-test: ## unit tests of the nameserver
 	cargo test -p dedan-resolver
 
-images: ## build the nameserver image (cargo-chef caches the dependency build)
+workspace-test: ## every crate's unit tests
+	cargo test --workspace
+
+images: ## build the services image (nameserver, auditor, aggregator; cargo-chef caches the dependency build)
 	$(COMPOSE) build resolver
 
 devnet: ## start anvil, deploy the contracts, register the city nodes on ENS, then the nameserver, Pebble, the origin, five city nodes and five users on the simulated WAN
@@ -38,7 +41,7 @@ devnet: ## start anvil, deploy the contracts, register the city nodes on ENS, th
 devnet-down: ## stop everything (cities added with add-node included) and delete volumes
 	@ids=$$(docker ps -aq --filter label=dedan.dynamic); [ -z "$$ids" ] || docker rm -f $$ids
 	rm -rf deploy/devnet/dynamic deploy/devnet/clients deploy/devnet/dynamic-hosts.txt contracts/deployments/nodes-*.json
-	$(COMPOSE) --profile smoke --profile full down -v --remove-orphans
+	$(COMPOSE) --profile smoke --profile full --profile settlement --profile sabotage down -v --remove-orphans
 
 devnet-reset: devnet-down devnet ## fresh devnet
 
@@ -56,3 +59,9 @@ add-node: ## add a node at a location to the running devnet: make add-node LABEL
 
 add-client: ## add a client (a human's device) at a location: make add-client LABEL=berlin LAT=52.52 LON=13.405
 	sh deploy/scripts/add-client.sh $(LABEL) $(LAT) $(LON)
+
+demo-settlement: ## fresh devnet: the settlement loop (city auditors, aggregator, countersigner) with a tampered node, a dead node, a spoofing attester and a lying auditor; report, recompute, void, claim
+	sh deploy/scripts/demo-settlement.sh
+
+settlement-down: ## stop the settlement loop and the sabotage containers (the rest of the devnet stays up)
+	$(COMPOSE) --profile settlement --profile sabotage rm -sf aggregator countersigner auditor-frankfurt auditor-tokyo auditor-seoul auditor-newyork auditor-istanbul auditor-spoof auditor-liar origin-tampered

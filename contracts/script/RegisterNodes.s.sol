@@ -3,15 +3,18 @@ pragma solidity ^0.8.20;
 
 import {Script, console2} from "forge-std/Script.sol";
 import {NameCoder} from "@ens/contracts/utils/NameCoder.sol";
+import {DedanCells} from "../src/DedanCells.sol";
 import {DedanRegistry} from "../src/DedanRegistry.sol";
 import {DedanResolver} from "../src/DedanResolver.sol";
+import {LibCell} from "../src/LibCell.sol";
 import {LibDnsWire} from "../src/LibDnsWire.sol";
 import {MockUSDC} from "../src/mocks/MockUSDC.sol";
 
 /// Registers the devnet's city nodes and attesters on the Dedan registry from deployments/nodes.json
 /// (copied from deploy/devnet/nodes.json by deploy/scripts/register-nodes.sh). Every operator and attester
 /// is a World ID-verified human (mock proofs); every node is an ENSv2 name whose owner then writes its
-/// records on the resolver: payout address, `dedan.*` text records and the DNS A record.
+/// records on the resolver: payout address, `dedan.*` text records and the DNS A record; then the owner joins
+/// the node to its cells (its own H3 cell and the ring around it, `cells` in nodes.json).
 contract RegisterNodes is Script {
     string constant MNEMONIC = "test test test test test test test test test test test junk";
 
@@ -24,11 +27,13 @@ contract RegisterNodes is Script {
         uint32 operator;
         uint32 hotKey;
         uint32 attester;
+        uint64[] cells;
     }
 
     MockUSDC usdc;
     DedanRegistry dedan;
     DedanResolver resolver;
+    DedanCells cells;
     string json;
 
     function run() external {
@@ -36,6 +41,7 @@ contract RegisterNodes is Script {
         usdc = MockUSDC(vm.parseJsonAddress(dep, ".usdc"));
         dedan = DedanRegistry(vm.parseJsonAddress(dep, ".dedanRegistry"));
         resolver = DedanResolver(vm.parseJsonAddress(dep, ".dedanResolver"));
+        cells = DedanCells(vm.parseJsonAddress(dep, ".dedanCells"));
         json = vm.readFile(vm.envOr("NODES_JSON", string("deployments/nodes.json")));
         uint256 count = vm.parseJsonUint(json, ".count");
         for (uint256 i = 0; i < count; i++) {
@@ -53,6 +59,11 @@ contract RegisterNodes is Script {
         n.operator = uint32(vm.parseJsonUint(json, string.concat(p, ".operator")));
         n.hotKey = uint32(vm.parseJsonUint(json, string.concat(p, ".hotKey")));
         n.attester = uint32(vm.parseJsonUint(json, string.concat(p, ".attester")));
+        uint256[] memory raw = vm.parseJsonUintArray(json, string.concat(p, ".cells"));
+        n.cells = new uint64[](raw.length);
+        for (uint256 k = 0; k < raw.length; k++) {
+            n.cells[k] = uint64(raw[k]);
+        }
     }
 
     function registerOne(Node memory n) internal {
@@ -67,6 +78,7 @@ contract RegisterNodes is Script {
         usdc.approve(address(dedan), 1_000e6);
         dedan.registerNode(n.label, signers, 1_000e6);
         resolver.multicall(calls);
+        cells.join(n.label, n.cells);
         vm.stopBroadcast();
 
         uint256 attesterPk = vm.deriveKey(MNEMONIC, n.attester);
@@ -76,6 +88,7 @@ contract RegisterNodes is Script {
             vm.stopBroadcast();
         }
         console2.log("registered %s.dedan.eth for operator %s, attester index %s", n.label, op, n.attester);
+        console2.log("  joined %s cells, e.g. %s.%s.dedan.eth", n.cells.length, n.label, LibCell.label(n.cells[0]));
     }
 
     /// The records every node publishes, as one resolver multicall by the owner.

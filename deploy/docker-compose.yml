@@ -12,6 +12,14 @@
 #   dashboard     demo web page on :9090 (nodes from ENS, the map, container logs, add a node at a location)
 #   dozzle        container logs and a browser terminal into any container, on :9999
 #   lego          (profile smoke) ACME client that issues a certificate through the mock DNS, as a node would
+#   auditor-<city>
+#                 (profile settlement) the auditor app (crates/auditor) run by each city's human: attestations to
+#                 the registry from its cell, assigned probes shipped to the aggregator
+#   aggregator, countersigner
+#                 (profile settlement) crates/aggregator: probe results in, published inputs and countersigned
+#                 roots out every DEDAN_PERIOD_SECS; the countersigner recomputes every period before signing
+#   auditor-spoof, auditor-liar, origin-tampered
+#                 (profile sabotage) the bad actors of `make demo-settlement`
 #   kubo          (profile full) IPFS node for the aggregator's published inputs, used from Phase 3 on
 #
 # Simulated WAN: the "wan" network (10.77.0.0/16, one /20 per city) with fixed addresses; every member applies tc netem
@@ -44,6 +52,48 @@ x-user: &user
   depends_on:
     - resolver
 
+x-chain-env: &chain-env
+  DEDAN_RPC_URL: http://anvil:8545
+  DEDAN_DEPLOYMENT: /deployments/devnet.json
+  DEDAN_ACCOUNTS: /devnet/accounts.json
+  DEDAN_HOSTS: /wan/hosts.txt:/devnet/dynamic-hosts.txt
+  DEDAN_MNEMONIC: "test test test test test test test test test test test junk"
+  DEDAN_PERIOD_SECS: "120" # a settlement day compressed into two minutes; the same code settles daily in production
+  DEDAN_SAMPLE_N: "4"
+  DEDAN_MAP_K: "1"
+  RUST_LOG: info
+
+x-chain-volumes: &chain-volumes
+  - ../contracts/deployments:/deployments:ro
+  - ./devnet:/devnet:ro
+  - ./wan/hosts.txt:/wan/hosts.txt:ro
+
+# the auditor app on the simulated WAN: the same delays as the city's user, its DNS at the nameserver
+x-auditor: &auditor
+  image: dedan-services:local
+  profiles: ["settlement"]
+  cap_add:
+    - NET_ADMIN
+  command: ["sh", "-c", "/wan/wan.sh && exec dedan-auditor"]
+  dns:
+    - 10.77.0.53
+  volumes:
+    - ../contracts/deployments:/deployments:ro
+    - ./devnet:/devnet:ro
+    - ./wan/wan.sh:/wan/wan.sh:ro
+    - ./wan/hosts.txt:/wan/hosts.txt:ro
+    - ./wan/latency.txt:/wan/latency.txt:ro
+  depends_on:
+    - resolver
+    - aggregator
+
+x-auditor-env: &auditor-env
+  <<: *chain-env
+  DEDAN_AGGREGATOR: http://aggregator:8060
+  DEDAN_PROBE_MEAN_SECS: "5"
+  DEDAN_ATTEST_SECS: "60"
+  DEDAN_BATCH_SECS: "20"
+
 services:
   anvil:
     <<: *foundry
@@ -70,10 +120,10 @@ services:
         condition: service_healthy
 
   resolver:
-    image: dedan-resolver:local
+    image: dedan-services:local
     build:
       context: ..
-      dockerfile: crates/resolver/Dockerfile
+      dockerfile: crates/Dockerfile
     environment:
       DEDAN_RPC_URL: http://anvil:8545
       DEDAN_DEPLOYMENT: /deployments/devnet.json
@@ -232,6 +282,151 @@ services:
       wan:
         ipv4_address: 10.77.80.30
 
+  aggregator:
+    image: dedan-services:local
+    profiles: ["settlement"]
+    command: ["dedan-aggregator", "serve"]
+    environment:
+      <<: *chain-env
+      DEDAN_KEY_INDEX: "8"
+      DEDAN_COUNTERSIGNER: http://countersigner:8061
+      DEDAN_DATA: /data
+      DEDAN_GRACE_SECS: "10"
+    volumes:
+      - ../contracts/deployments:/deployments:ro
+      - ./devnet:/devnet:ro
+      - ./wan/hosts.txt:/wan/hosts.txt:ro
+      - settlement-data:/data
+    ports:
+      - "8060:8060" # /health, /periods, POST /v1/probe-results
+    depends_on:
+      - resolver
+      - countersigner
+      - origin
+
+  countersigner:
+    image: dedan-services:local
+    profiles: ["settlement"]
+    command: ["dedan-aggregator", "countersign"]
+    environment:
+      <<: *chain-env
+      DEDAN_KEY_INDEX: "9"
+      DEDAN_DATA: /data
+    volumes:
+      - ../contracts/deployments:/deployments:ro
+      - ./devnet:/devnet:ro
+      - ./wan/hosts.txt:/wan/hosts.txt:ro
+      - settlement-data:/data # the aggregator's published inputs, read back independently before signing
+    ports:
+      - "8061:8061"
+    depends_on:
+      - resolver
+
+  auditor-frankfurt:
+    <<: *auditor
+    environment:
+      <<: *auditor-env
+      CITY: frankfurt
+      DEDAN_KEY_INDEX: "20"
+      DEDAN_LOCATION: "50.1109,8.6821"
+    networks:
+      default: {}
+      wan:
+        ipv4_address: 10.77.16.31
+
+  auditor-tokyo:
+    <<: *auditor
+    environment:
+      <<: *auditor-env
+      CITY: tokyo
+      DEDAN_KEY_INDEX: "21"
+      DEDAN_LOCATION: "35.6762,139.6503"
+    networks:
+      default: {}
+      wan:
+        ipv4_address: 10.77.32.31
+
+  auditor-seoul:
+    <<: *auditor
+    environment:
+      <<: *auditor-env
+      CITY: seoul
+      DEDAN_KEY_INDEX: "22"
+      DEDAN_LOCATION: "37.5665,126.978"
+    networks:
+      default: {}
+      wan:
+        ipv4_address: 10.77.48.31
+
+  auditor-newyork:
+    <<: *auditor
+    environment:
+      <<: *auditor-env
+      CITY: newyork
+      DEDAN_KEY_INDEX: "23"
+      DEDAN_LOCATION: "40.7128,-74.006"
+    networks:
+      default: {}
+      wan:
+        ipv4_address: 10.77.64.31
+
+  auditor-istanbul:
+    <<: *auditor
+    environment:
+      <<: *auditor-env
+      CITY: istanbul
+      DEDAN_KEY_INDEX: "24"
+      DEDAN_LOCATION: "41.0082,28.9784"
+    networks:
+      default: {}
+      wan:
+        ipv4_address: 10.77.80.31
+
+  # a human on an Istanbul network claiming the Seoul cell: it attests Seoul's members from 9,000 km away, and
+  # every attestation lands in evidence as out_of_area (the contract counts it as one vote)
+  auditor-spoof:
+    <<: *auditor
+    profiles: ["sabotage"]
+    environment:
+      <<: *auditor-env
+      CITY: istanbul
+      DEDAN_KEY_INDEX: "25"
+      DEDAN_LOCATION: "37.5665,126.978"
+      DEDAN_PROBES: "0"
+    networks:
+      default: {}
+      wan:
+        ipv4_address: 10.77.80.32
+
+  # an auditor in New York that never fetches anything and reports every probe up with a made-up token
+  auditor-liar:
+    <<: *auditor
+    profiles: ["sabotage"]
+    environment:
+      <<: *auditor-env
+      CITY: newyork
+      DEDAN_KEY_INDEX: "26"
+      DEDAN_LOCATION: "40.7128,-74.006"
+      DEDAN_DEVNET_LIE: "1"
+    networks:
+      default: {}
+      wan:
+        ipv4_address: 10.77.64.32
+
+  # the real origin's files with one byte appended to each: what a node serving wrong bytes looks like
+  origin-tampered:
+    <<: *wan
+    profiles: ["sabotage"]
+    environment:
+      CITY: newyork
+    volumes:
+      - ./origin/html:/srv/origin:ro
+      - ./origin/10-tamper.sh:/docker-entrypoint.d/10-tamper.sh:ro
+    networks:
+      default: {}
+      wan:
+        ipv4_address: 10.77.64.21
+
   lego:
     image: goacme/lego:latest
     profiles: ["smoke"]
@@ -293,5 +488,6 @@ networks:
 volumes:
   pebble-certs:
   lego-data:
+  settlement-data:
   foundry-home:
     name: dedan-foundry-home # shared with the Makefile's docker-run targets
