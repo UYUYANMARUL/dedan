@@ -1,5 +1,0 @@
-asoma frankfurt 298 12
-asoma tokyo 52 3
-asoma seoul 20 1
-asoma newyork 414 17
-asoma istanbul 366 15

@@ -36,7 +36,6 @@ ens_text() {
   dns=$(python3 -c "print('0x' + ''.join('%02x%s' % (len(l), l.encode().hex()) for l in '$1'.split('.')) + '00')")
   $COMPOSE run --rm -T deployer "node=\$(cast namehash $1); data=\$(cast calldata 'text(bytes32,string)' \$node '$2'); out=\$(cast call $(deployed universalResolver) 'resolve(bytes,bytes)(bytes,address)' $dns \$data --rpc-url http://anvil:8545 | head -1); cast abi-decode 'f()(string)' \$out" 2>/dev/null | tr -d '\r\n"'
 }
-token_key() { python3 -c "import json; print(json.load(open('deploy/devnet/keys.json'))['k_hour'])"; }
 
 user() { c=$1; shift; docker exec -i "dedan-devnet-user-$c-1" "$@"; }
 node() { c=$1; shift; docker exec -i "dedan-devnet-$c-1" "$@"; }
@@ -60,16 +59,6 @@ fetch_token() {
     [ -n "$t" ] && break
   done
   printf '%s' "$t"
-}
-# the node's hot key reveals this hour's token key on chain (and the next hour's when the hour is about to roll
-# over, so tokens minted right after the boundary still verify; the mock nodes use the same key every hour)
-reveal_key() {
-  hour=$(( $(date +%s) / 3600 )); hours=$hour
-  [ "$(date -u +%M)" -lt 55 ] || hours="$hour $((hour + 1))"
-  for h in $hours; do
-    cast send "$(registry)" "\"revealKey(string,uint64,bytes32)\"" "$1" "$h" "0x$(token_key)" \
-      --private-key "$(private_key "$(node_field "$1" hotKey)")" --rpc-url http://anvil:8545 >/dev/null
-  done
 }
 # the human in city $1 (its registered attester, or the key ATTESTER_INDEX) pings and fetches from every node
 # that joined its cell (or those of them named after it), then sends one attest batch to the cells contract;

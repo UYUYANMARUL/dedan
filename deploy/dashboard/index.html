@@ -231,7 +231,7 @@ function render() {
   $('#nodes').innerHTML = nodes.map(n => `<tr>
     <td class="nowrap"><code>${esc(n.name)}</code></td><td class="nowrap"><code>${esc(n.ipv4 || '')}</code></td>
     <td class="nowrap">${n.location ? `${n.location.lat}, ${n.location.lon}` : ''}</td><td>${esc(n.class)}</td><td class="num">${(n.stake / 1e6).toLocaleString()} USDC</td>
-    <td class="${n.active ? 'ok' : 'bad'}">${n.active ? 'active' : 'inactive'}</td>
+    <td class="${n.active ? 'ok' : 'bad'}">${n.active ? 'active' : 'inactive'}${n.up === false ? ' <span class="bad">· no heartbeat</span>' : n.heartbeat ? ` <span class="dim">· heartbeat ${n.heartbeat.age_s}s ago</span>` : ''}</td>
     <td>${inSet.has(n.label) ? '<span class="ok">acme</span>' : '<span class="dim">—</span>'}</td>
     <td>${closest[n.label] ? `${closest[n.label]} cell${closest[n.label] > 1 ? 's' : ''}` : '<span class="dim">no cell</span>'}</td>
     <td>${logLink(n.label)}</td><td>${termLink(n.label)}</td></tr>`).join('') || '<tr><td colspan="10" class="dim">no nodes yet (the nameserver syncs every 10 s)</td></tr>';

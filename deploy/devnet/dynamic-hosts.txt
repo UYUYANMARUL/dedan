@@ -1,5 +1,0 @@
-user-some          some       10.77.1.30    user    35.0 26.0
-user-somes         somes      10.77.2.30    user    35.27 127.0
-user-som           som        10.77.3.30    user    35.27 127.0
-user-asom          asom       10.77.4.30    user    33.27 127.0
-user-asoma         asoma      10.77.5.30    user    34.27 127.0

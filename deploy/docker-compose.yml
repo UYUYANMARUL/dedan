@@ -7,8 +7,10 @@
 #   pebble        ACME CA (stands in for Let's Encrypt), validates DNS-01 against the resolver
 #   origin        sample customer origin with assets and large blobs, located in New York on the simulated WAN
 #   frankfurt, tokyo, seoul, newyork, istanbul
-#                 mock CDN nodes (nginx cache in front of the origin, minting fetch tokens; stand-ins for the Pingora node)
+#                 Dedan nodes (crates/node, Pingora): cache in front of the origin, hourly token keys revealed on chain,
+#                 heartbeats to the nameserver
 #   user-<city>   a shell per city on the simulated WAN whose DNS goes to the resolver: attester and end user
+#   cp            the control plane (crates/cp): signed configs, purges, ACME orders for the nodes; :8070
 #   dashboard     demo web page on :9090 (nodes from ENS, the map, container logs, add a node at a location)
 #   dozzle        container logs and a browser terminal into any container, on :9999
 #   lego          (profile smoke) ACME client that issues a certificate through the mock DNS, as a node would
@@ -37,12 +39,35 @@ x-wan: &wan
   cap_add:
     - NET_ADMIN
 
+# a Dedan node (crates/node): Pingora proxy + cache in front of the account's origin, real hourly token keys
+# revealed on chain by its hot key, heartbeats to the nameserver; WAN delays like every other city container
 x-node: &node
-  <<: *wan
+  image: dedan-services:local
+  cap_add:
+    - NET_ADMIN
+  command: ["sh", "-c", "/wan/wan.sh && exec dedan-node"]
   volumes:
-    - ./wan/node.conf.template:/etc/nginx/templates/default.conf.template:ro
+    - ../contracts/deployments:/deployments:ro
+    - ./devnet:/devnet:ro
+    - ./wan/wan.sh:/wan/wan.sh:ro
+    - ./wan/hosts.txt:/wan/hosts.txt:ro
+    - ./wan/latency.txt:/wan/latency.txt:ro
   depends_on:
     - origin
+    - resolver
+    - cp
+
+x-node-env: &node-env
+  DEDAN_RPC_URL: http://anvil:8545
+  DEDAN_DEPLOYMENT: /deployments/devnet.json
+  DEDAN_ACCOUNTS: /devnet/accounts.json
+  DEDAN_MNEMONIC: "test test test test test test test test test test test junk"
+  DEDAN_RESOLVERS: http://10.77.0.53:8055
+  DEDAN_CP_URL: http://cp:8070
+  DEDAN_ZONE: dedan-cdn.test
+  DEDAN_REVEAL_IMMEDIATELY: "1" # devnet: tokens verify at once instead of after the hour
+  DEDAN_DEFAULT_TTL_SECS: "60" # short, so `make e2e` can show stale-if-error within a minute
+  RUST_LOG: info
 
 x-user: &user
   <<: *wan
@@ -125,6 +150,9 @@ services:
       context: ..
       dockerfile: crates/Dockerfile
     environment:
+      DEDAN_HEARTBEAT_TIMEOUT_SECS: "30" # a node without a heartbeat for 30 s is not answered
+      DEDAN_CP_URL: http://cp:8070 # signed account configs; the account file until the control plane answers
+      DEDAN_CHALLENGE_SECS: "600" # a name's endpoint must answer the challenge before its record is served
       DEDAN_RPC_URL: http://anvil:8545
       DEDAN_DEPLOYMENT: /deployments/devnet.json
       DEDAN_ACCOUNTS: /devnet/accounts.json
@@ -153,6 +181,37 @@ services:
     depends_on:
       anvil:
         condition: service_healthy
+
+  # the control plane (crates/cp): signed account configs and purges over an event stream, ACME orders at Pebble
+  # with DNS-01 through the nameserver's TXT API, certificates back to the nodes
+  cp:
+    image: dedan-services:local
+    command: ["dedan-cp"]
+    environment:
+      DEDAN_RPC_URL: http://anvil:8545
+      DEDAN_DEPLOYMENT: /deployments/devnet.json
+      DEDAN_ACCOUNTS: /devnet/accounts.json
+      DEDAN_MNEMONIC: "test test test test test test test test test test test junk"
+      DEDAN_KEY_INDEX: "10"
+      DEDAN_RESOLVERS: http://resolver:8055
+      DEDAN_ACME_DIR: https://pebble:14000/dir
+      DEDAN_ACME_ROOT: /pebble-certs/pebble.minica.pem
+      DEDAN_ZONE: dedan-cdn.test
+      RUST_LOG: info
+    volumes:
+      - ../contracts/deployments:/deployments:ro
+      - ./devnet:/devnet:ro
+      - pebble-certs:/pebble-certs:ro
+    ports:
+      - "8070:8070" # /health, /v1/configs, /v1/stream, POST /v1/purge, POST /v1/certs
+    healthcheck:
+      test: ["CMD", "curl", "-sf", "http://127.0.0.1:8070/health"]
+      interval: 2s
+      timeout: 3s
+      retries: 30
+    depends_on:
+      - pebble
+      - resolver
 
   pebble:
     image: ghcr.io/letsencrypt/pebble:latest
@@ -185,10 +244,12 @@ services:
   frankfurt:
     <<: *node
     environment:
+      <<: *node-env
       CITY: frankfurt
       NODE_ID: frankfurt
-      DEDAN_TOKEN_KEY: "0101010101010101010101010101010101010101010101010101010101010101"
+      DEDAN_KEY_INDEX: "12" # the node's hot key (ROLE_NODE_SIGNER)
     networks:
+      default: {}
       wan:
         ipv4_address: 10.77.16.1
     ports:
@@ -197,10 +258,12 @@ services:
   tokyo:
     <<: *node
     environment:
+      <<: *node-env
       CITY: tokyo
       NODE_ID: tokyo
-      DEDAN_TOKEN_KEY: "0101010101010101010101010101010101010101010101010101010101010101"
+      DEDAN_KEY_INDEX: "13" # the node's hot key (ROLE_NODE_SIGNER)
     networks:
+      default: {}
       wan:
         ipv4_address: 10.77.32.1
     ports:
@@ -209,10 +272,12 @@ services:
   seoul:
     <<: *node
     environment:
+      <<: *node-env
       CITY: seoul
       NODE_ID: seoul
-      DEDAN_TOKEN_KEY: "0101010101010101010101010101010101010101010101010101010101010101"
+      DEDAN_KEY_INDEX: "14" # the node's hot key (ROLE_NODE_SIGNER)
     networks:
+      default: {}
       wan:
         ipv4_address: 10.77.48.1
     ports:
@@ -221,10 +286,12 @@ services:
   newyork:
     <<: *node
     environment:
+      <<: *node-env
       CITY: newyork
       NODE_ID: newyork
-      DEDAN_TOKEN_KEY: "0101010101010101010101010101010101010101010101010101010101010101"
+      DEDAN_KEY_INDEX: "15" # the node's hot key (ROLE_NODE_SIGNER)
     networks:
+      default: {}
       wan:
         ipv4_address: 10.77.64.1
     ports:
@@ -233,10 +300,12 @@ services:
   istanbul:
     <<: *node
     environment:
+      <<: *node-env
       CITY: istanbul
       NODE_ID: istanbul
-      DEDAN_TOKEN_KEY: "0101010101010101010101010101010101010101010101010101010101010101"
+      DEDAN_KEY_INDEX: "16" # the node's hot key (ROLE_NODE_SIGNER)
     networks:
+      default: {}
       wan:
         ipv4_address: 10.77.80.1
     ports:

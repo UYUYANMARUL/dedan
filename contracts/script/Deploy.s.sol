@@ -22,8 +22,8 @@ import {MockWorldID} from "../src/mocks/MockWorldID.sol";
 /// Devnet deployment: mock USDC and World ID, the ENSv2 tree (root → eth → dedan, the last one being Dedan's own
 /// registry), the node resolver, the cells contract, the Universal Resolver, Settlement, minimum stakes, signer set, price table and
 /// funded actors. Anvil runs with 60 accounts (30+ for cities added at runtime): 0 governance, 1 customer, 2-6 city node operators, 7 smoke operator,
-/// 8 aggregator, 9 countersigner, 12-16 city hot keys, 17 smoke hot key, 20-24 city attesters, 25 smoke attester,
-/// 26 smoke auditor.
+/// 8 aggregator, 9 countersigner, 10 control plane, 12-16 city hot keys, 17 smoke hot key, 20-24 city attesters,
+/// 25 smoke attester, 26 smoke auditor.
 contract Deploy is Script {
     string constant MNEMONIC = "test test test test test test test test test test test junk";
     uint256 constant TLD_GOV_ROLES = RegistryRolesLib.ROLE_REGISTRAR | RegistryRolesLib.ROLE_REGISTRAR_ADMIN
@@ -46,6 +46,7 @@ contract Deploy is Script {
         address gov = vm.addr(govPk);
         address aggregator = vm.addr(vm.deriveKey(MNEMONIC, 8));
         address countersigner = vm.addr(vm.deriveKey(MNEMONIC, 9));
+        address controlPlane = vm.addr(vm.deriveKey(MNEMONIC, 10));
 
         vm.startBroadcast(govPk);
         usdc = new MockUSDC();
@@ -57,7 +58,7 @@ contract Deploy is Script {
         }
         vm.stopBroadcast();
 
-        writeJson(gov, aggregator, countersigner);
+        writeJson(gov, aggregator, countersigner, controlPlane);
         console2.log("rootRegistry      ", address(root));
         console2.log("dedanRegistry     ", address(dedan));
         console2.log("dedanResolver     ", address(resolver));
@@ -100,7 +101,7 @@ contract Deploy is Script {
         settlement.setPriceTable(1, keccak256("dedan-price-table-v1"));
     }
 
-    function writeJson(address gov, address aggregator, address countersigner) internal {
+    function writeJson(address gov, address aggregator, address countersigner, address controlPlane) internal {
         string memory j = "devnet";
         vm.serializeUint(j, "chainId", block.chainid);
         vm.serializeAddress(j, "usdc", address(usdc));
@@ -115,6 +116,7 @@ contract Deploy is Script {
         vm.serializeAddress(j, "governance", gov);
         vm.serializeAddress(j, "aggregator", aggregator);
         vm.serializeAddress(j, "countersigner", countersigner);
+        vm.serializeAddress(j, "controlPlane", controlPlane);
         string memory out = vm.serializeAddress(j, "settlement", address(settlement));
         vm.writeJson(out, "deployments/devnet.json");
     }

@@ -3,7 +3,8 @@
 #   1. measured round trips between the city nodes
 #   2. the node names and records as the nameserver resolved them from ENS, and the cells the nodes joined
 #   3. verified humans (city users and added clients) attest round trips to the members of their cell, to the cells
-#      contract, with the fetch tokens the nodes minted: one vote per human per node per cell, medians on chain;
+#      contract, with the fetch tokens the nodes minted (keys the nodes revealed on chain): one vote per human per node
+#      per cell, medians on chain;
 #      a spoofed batch counts as one vote and lands in the evidence
 #   4. what the nameserver answers for a client in each city (ECS), and the customer onboarding chain
 #   5. the Frankfurt operator changes its node's IP record on chain; the DNS answer follows
@@ -41,8 +42,7 @@ for c in json.load(sys.stdin)['cells']:
     print('%-26s centre %7.2f,%7.2f  members: %s' % (c['name'], c['centre']['lat'], c['centre']['lon'], ', '.join(c['members'])))"
 
 echo
-echo "== hot keys reveal this hour's token key on chain, then a verified human in each city attests its cell's members"
-for c in $all; do reveal_key "$c"; done
+echo "== the nodes revealed their token keys on chain themselves; a verified human in each city attests its cell's members"
 for h in $(users); do attest_from "$h" || true; done   # an unverified client's batch is rejected: that is the point
 # a spoofed batch: an Istanbul human claims the Tokyo cell; the contract takes it as one vote, the token still
 # binds its Istanbul network, so the map's evidence names it

@@ -30,6 +30,9 @@ pub struct Deployment {
     pub governance: Address,
     pub aggregator: Address,
     pub countersigner: Address,
+    /// The control plane's signing key: configs, purges it relays and TXT records carry its signature.
+    #[serde(default)]
+    pub control_plane: Address,
 }
 
 impl Deployment {

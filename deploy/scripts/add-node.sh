@@ -32,9 +32,13 @@ hosts | awk -v me="$label" -v lat="$lat" -v lon="$lon" '$4=="node" {
   a = sin(dlat / 2) ^ 2 + cos(lat * pi / 180) * cos($5 * pi / 180) * sin(dlon / 2) ^ 2
   km = 2 * 6371 * atan2(sqrt(a), sqrt(1 - a)); printf "%s %s %d\n", me, $2, 2 * int(5 + 0.02 * km) }' > "$dir/latency.txt"
 docker run -d --name "dedan-devnet-$label-1" --label "dedan.dynamic=$label" --network dedan-devnet_wan --ip "$node_ip" \
-  --cap-add NET_ADMIN -e CITY="$label" -e NODE_ID="$label" -e DEDAN_TOKEN_KEY="$(token_key)" \
-  -v "$PWD/deploy/wan/node.conf.template:/etc/nginx/templates/default.conf.template:ro" \
-  -v "$PWD/$dir/hosts.txt:/wan/hosts.txt:ro" -v "$PWD/$dir/latency.txt:/wan/latency.txt:ro" dedan-wan:local >/dev/null
+  --cap-add NET_ADMIN -e CITY="$label" -e NODE_ID="$label" -e DEDAN_KEY_INDEX="$hot" -e DEDAN_MNEMONIC="$MNEMONIC" \
+  -e DEDAN_RPC_URL=http://anvil:8545 -e DEDAN_DEPLOYMENT=/deployments/devnet.json -e DEDAN_ACCOUNTS=/devnet/accounts.json \
+  -e DEDAN_RESOLVERS=http://10.77.0.53:8055 -e DEDAN_CP_URL=http://cp:8070 -e DEDAN_ZONE=dedan-cdn.test -e DEDAN_REVEAL_IMMEDIATELY=1 -e DEDAN_DEFAULT_TTL_SECS=60 -e RUST_LOG=info \
+  -v "$PWD/contracts/deployments:/deployments:ro" -v "$PWD/deploy/devnet:/devnet:ro" -v "$PWD/deploy/wan/wan.sh:/wan/wan.sh:ro" \
+  -v "$PWD/$dir/hosts.txt:/wan/hosts.txt:ro" -v "$PWD/$dir/latency.txt:/wan/latency.txt:ro" dedan-services:local \
+  sh -c "/wan/wan.sh && exec dedan-node" >/dev/null
+docker network connect dedan-devnet_default "dedan-devnet-$label-1"   # anvil and the origin by name; the WAN interface came first for wan.sh
 docker run -d --name "dedan-devnet-user-$label-1" --label "dedan.dynamic=$label" --network dedan-devnet_wan --ip "$user_ip" \
   --cap-add NET_ADMIN --dns 10.77.0.53 -e CITY="$label" \
   -v "$PWD/$dir/hosts.txt:/wan/hosts.txt:ro" -v "$PWD/$dir/latency.txt:/wan/latency.txt:ro" dedan-wan:local \
@@ -58,8 +62,7 @@ echo "$label.dedan.eth resolved by the nameserver: $(curl -sf "$NS_API/nodes" | 
 import json,sys; n=[x for x in json.load(sys.stdin)['nodes'] if x['label']=='$label'][0]; print('ipv4', n['ipv4'], 'owner', n['owner'][:10], 'active', n['active'])")"
 
 echo "== every human attests the members of its own cell (one vote per node; the new node's cell now has a member)"
-for n in $(cities); do reveal_key "$n"; done   # tokens verify only against revealed keys (auditor pay and evidence)
-for h in $(users); do attest_from "$h" || true; done
+for h in $(users); do attest_from "$h" || true; done   # the nodes reveal their own token keys on chain
 sleep 12
 echo "== done. Try it:"
 echo "  docker exec dedan-devnet-user-$label-1 dig +short www.images.com"

@@ -11,7 +11,6 @@ city=${1:?city}; index=${2:--}; shift; [ $# -eq 0 ] || shift
 [ "$index" != "-" ] || index=$(node_field "$city" attester)
 echo "== human in $city (key index $index, account $(address_of "$index")) measures: $*"
 # ponytail: reveal on every submit; the identity cache dedups reveals, and real nodes reveal on their own hourly
-for n in "$@"; do reveal_key "$n"; done
 echo "hour keys revealed by the nodes' hot keys"
 VERBOSE=1 ATTESTER_INDEX=$index attest_from "$city" "$@"
 echo "the nameserver rebuilds the map from the chain within about 12 s"

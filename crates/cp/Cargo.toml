@@ -1,0 +1,23 @@
+[package]
+name = "dedan-cp"
+version = "0.1.0"
+description = "Dedan's control plane: signed account configs and purges over an event stream, and the ACME orders nodes cannot run alone"
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+dedan-core = { path = "../core" }
+alloy = { version = "2.5", features = ["provider-http", "rpc-types", "sol-types", "signer-local", "contract"] }
+axum = "0.8"
+hex = "0.4"
+instant-acme = "0.8"
+pem = "3"
+rustls = { version = "0.23", default-features = false, features = ["ring", "std"] }
+reqwest = { version = "0.13", default-features = false, features = ["json"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+tokio = { version = "1", features = ["full"] }
+tokio-stream = { version = "0.1", features = ["sync"] }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }

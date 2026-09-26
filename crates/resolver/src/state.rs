@@ -36,6 +36,12 @@ pub struct Config {
     pub sync_secs: u64,
     pub map_k: usize,
     pub ns_ip: Ipv4Addr,
+    /// A node without a heartbeat for this long is not answered (3 missed 10 s beats); 0 disables the check.
+    pub heartbeat_timeout: u64,
+    /// The control plane's API: signed account configs replace the account file when set.
+    pub cp_url: Option<String>,
+    /// Challenge a name's endpoint before answering its record (§6); 0 disables, else the re-check interval.
+    pub challenge_secs: u64,
 }
 
 impl Config {
@@ -56,12 +62,125 @@ impl Config {
             sync_secs: get("DEDAN_SYNC_SECS", "10").parse()?,
             map_k: get("DEDAN_MAP_K", "1").parse()?,
             ns_ip: get("DEDAN_NS_IP", "10.77.0.53").parse()?,
+            heartbeat_timeout: get("DEDAN_HEARTBEAT_TIMEOUT_SECS", "30").parse()?,
+            cp_url: std::env::var("DEDAN_CP_URL").ok().filter(|s| !s.is_empty()),
+            challenge_secs: get("DEDAN_CHALLENGE_SECS", "3600").parse()?,
         })
     }
 
     /// The zone with its trailing dot, lowercase.
     pub fn zone_dot(&self) -> String {
         format!("{}.", self.zone)
+    }
+}
+
+impl State {
+    pub fn accounts(&self) -> Vec<AccountInfo> {
+        self.accounts.read().expect("accounts lock").clone()
+    }
+
+    /// The endpoint the name's record claims, once it proved itself (or the check is off).
+    pub fn verified_ip(&self, node: &NodeId, record: Option<Ipv4Addr>) -> Option<Ipv4Addr> {
+        let ip = record?;
+        if self.cfg.challenge_secs == 0 {
+            return Some(ip);
+        }
+        self.verified
+            .read()
+            .expect("verified lock")
+            .get(node)
+            .filter(|(v, _)| *v == ip)
+            .map(|(v, _)| *v)
+    }
+
+    /// The control plane's configs, signed by its key, become the account list.
+    async fn sync_accounts(&self, cp_url: &str, cp_key: Address) -> Result<(), Error> {
+        let v: serde_json::Value = self
+            .http
+            .get(format!("{}/v1/configs", cp_url.trim_end_matches('/')))
+            .send()
+            .await?
+            .json()
+            .await?;
+        let mut accounts = Vec::new();
+        for c in v["configs"].as_array().cloned().unwrap_or_default() {
+            let env: dedan_core::envelope::Envelope<AccountConfig> = serde_json::from_value(c)?;
+            if env.signer != "cp" || env.recover()? != cp_key {
+                tracing::warn!(account = %env.payload.account_id, "config not signed by the control plane; ignored");
+                continue;
+            }
+            let p = env.payload;
+            accounts.push(AccountInfo {
+                id: p.account_id,
+                nodes: p.tier.nodes,
+                class: p.tier.class,
+                availability: p.tier.availability,
+                min_node_stake: p.node_policy.min_node_stake,
+                operator_allowlist: p.node_policy.operator_allowlist,
+                operator_denylist: p.node_policy.operator_denylist,
+            });
+        }
+        *self.accounts.write().expect("accounts lock") = accounts;
+        Ok(())
+    }
+
+    /// `GET http://<ip>:<port>/.well-known/dedan/challenge/<nonce>` must come back signed by a current signer
+    /// key of the name (EIP-191 over the nonce). One endpoint per node; re-checked every `challenge_secs`.
+    async fn challenge(&self, identity: &Identity, records: &BTreeMap<NodeId, NodeRecord>, now: u64) {
+        for (label, rec) in records {
+            let Some(ip) = rec.ipv4 else { continue };
+            let fresh = self
+                .verified
+                .read()
+                .expect("verified lock")
+                .get(label)
+                .is_some_and(|(v, at)| *v == ip && now.saturating_sub(*at) < self.cfg.challenge_secs);
+            if fresh {
+                continue;
+            }
+            let nonce = format!("{:x}", alloy::primitives::keccak256(format!("{label}:{ip}:{now}")));
+            let url = format!("http://{ip}:{}/.well-known/dedan/challenge/{nonce}", rec.port);
+            let ok = match self.http.get(&url).send().await {
+                Ok(r) => match r.json::<serde_json::Value>().await {
+                    Ok(v) => {
+                        let sig = v["sig"].as_str().unwrap_or("");
+                        let signed_nonce = v["nonce"].as_str().unwrap_or("");
+                        let raw = hex::decode(sig.trim_start_matches("0x")).unwrap_or_default();
+                        let signer = alloy::primitives::Signature::try_from(raw.as_slice())
+                            .ok()
+                            .and_then(|s| s.recover_address_from_msg(nonce.as_bytes()).ok());
+                        signed_nonce == nonce
+                            && v["label"].as_str() == Some(label.0.as_str())
+                            && signer.is_some_and(|s| identity.signers(label).contains(&s))
+                    }
+                    Err(_) => false,
+                },
+                Err(_) => false,
+            };
+            let mut verified = self.verified.write().expect("verified lock");
+            if ok {
+                if !verified.get(label).is_some_and(|(v, _)| *v == ip) {
+                    info!(node = %label, %ip, "endpoint challenge passed");
+                }
+                verified.insert(label.clone(), (ip, now));
+            } else {
+                if verified.remove(label).is_some() {
+                    tracing::warn!(node = %label, %ip, "endpoint challenge failed; the record is not answered");
+                }
+            }
+        }
+    }
+
+    /// Up = a heartbeat inside the timeout (or the check is off).
+    pub async fn is_up(&self, node: &NodeId, now: u64) -> bool {
+        if self.cfg.heartbeat_timeout == 0 {
+            return true;
+        }
+        self.heartbeats
+            .read()
+            .await
+            .get(node)
+            .is_some_and(|(at, hb)| now.saturating_sub(*at) <= self.cfg.heartbeat_timeout && !hb.drain)
     }
 }
 
@@ -79,10 +198,17 @@ pub struct Snapshot {
 
 pub struct State {
     pub cfg: Config,
-    pub accounts: Vec<AccountInfo>,
+    /// The accounts: from the control plane's signed configs when it is configured, else the account file.
+    pub accounts: std::sync::RwLock<Vec<AccountInfo>>,
+    /// Endpoints that answered the challenge with a signature of a current signer key: node → (ip, when).
+    pub verified: std::sync::RwLock<HashMap<NodeId, (Ipv4Addr, u64)>>,
+    pub http: reqwest::Client,
     pub geo: std::sync::RwLock<Geo>,
     /// ACME TXT records published through the management API, by lowercase fqdn with trailing dot.
     pub txt: RwLock<HashMap<String, Vec<String>>>,
+    /// The last heartbeat of each node (§5): when it arrived and what it said.
+    pub heartbeats: RwLock<HashMap<NodeId, (u64, Heartbeat)>>,
+    pub nonces: tokio::sync::Mutex<dedan_core::envelope::NonceCache>,
     pub snap: RwLock<Snapshot>,
     provider: RootProvider,
     /// Contract addresses from the deployment file, re-read on every refresh: the devnet starts the nameserver
@@ -106,10 +232,9 @@ pub fn unix_now() -> u64 {
 
 impl State {
     pub async fn new(cfg: Config) -> Result<Self, Error> {
-        let accounts: Vec<AccountInfo> = AccountCfg::load_all(&cfg.accounts)?
-            .iter()
-            .map(AccountCfg::info)
-            .collect();
+        let accounts: Vec<AccountInfo> = AccountCfg::load_all(&cfg.accounts)
+            .map(|a| a.iter().map(AccountCfg::info).collect())
+            .unwrap_or_default();
         let geo = Geo::from_files(&cfg.hosts);
         let provider = RootProvider::new_http(cfg.rpc_url.parse()?);
         info!(
@@ -119,9 +244,15 @@ impl State {
         );
         Ok(Self {
             cfg,
-            accounts,
+            accounts: std::sync::RwLock::new(accounts),
+            verified: std::sync::RwLock::new(HashMap::new()),
+            http: reqwest::Client::builder()
+                .timeout(std::time::Duration::from_secs(3))
+                .build()?,
             geo: std::sync::RwLock::new(geo),
             txt: RwLock::new(HashMap::new()),
+            heartbeats: RwLock::new(HashMap::new()),
+            nonces: tokio::sync::Mutex::new(dedan_core::envelope::NonceCache::default()),
             snap: RwLock::new(Snapshot::default()),
             provider,
             chain: RwLock::new(None),
@@ -174,6 +305,14 @@ impl State {
             .await?;
         let records = chain.ens.node_records(identity.nodes.keys()).await?;
         let now = unix_now();
+        if let Some(cp) = &self.cfg.cp_url {
+            if let Err(e) = self.sync_accounts(cp, Deployment::load(&self.cfg.deployment)?.control_plane).await {
+                tracing::warn!(error = %e, "control plane configs unavailable; keeping the last account list");
+            }
+        }
+        if self.cfg.challenge_secs > 0 {
+            self.challenge(&identity, &records, now).await;
+        }
         let params = MapParams {
             k_min: self.cfg.map_k,
             ..MapParams::v1()
@@ -204,10 +343,11 @@ impl State {
             quality: &quality,
         };
         let seed = schedule::seed_of(now);
+        let accounts = self.accounts();
         let assignment = assign(
             seed,
             &nodes,
-            &self.accounts,
+            &accounts,
             &map,
             Some(&yesterday),
             &AssignParams::default(),

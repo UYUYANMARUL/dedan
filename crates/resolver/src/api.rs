@@ -22,6 +22,7 @@ pub fn router(state: Arc<State>) -> Router {
         .route("/assignment", get(assignment))
         .route("/cell", get(cell))
         .route("/cells", get(cells))
+        .route("/heartbeat", post(heartbeat))
         .route("/set-txt", post(set_txt))
         .route("/clear-txt", post(clear_txt))
         .with_state(state)
@@ -100,20 +101,50 @@ async fn health(AxState(s): AxState<Arc<State>>) -> Json<Value> {
     )
 }
 
+/// `POST /heartbeat`: a node's signed heartbeat (§5); accepted from a current `ROLE_NODE_SIGNER` key of the name.
+async fn heartbeat(
+    AxState(s): AxState<Arc<State>>,
+    body: Bytes,
+) -> Result<Json<Value>, (StatusCode, String)> {
+    let env: dedan_core::envelope::Envelope<dedan_core::types::Heartbeat> =
+        serde_json::from_slice(&body).map_err(|e| (StatusCode::BAD_REQUEST, e.to_string()))?;
+    let now = crate::state::unix_now();
+    {
+        let snap = s.snap.read().await;
+        let mut nonces = s.nonces.lock().await;
+        env.verify(&snap.identity, now, &mut nonces)
+            .map_err(|e| (StatusCode::UNAUTHORIZED, e.to_string()))?;
+    }
+    if env.signer != env.payload.node_id.signer() {
+        return Err((StatusCode::BAD_REQUEST, "node id differs from the signer".into()));
+    }
+    s.heartbeats
+        .write()
+        .await
+        .insert(env.payload.node_id.clone(), (now, env.payload));
+    Ok(Json(json!({ "ok": true })))
+}
+
 async fn nodes(AxState(s): AxState<Arc<State>>) -> Json<Value> {
     let snap = s.snap.read().await;
+    let beats = s.heartbeats.read().await;
+    let now = crate::state::unix_now();
     let nodes: Vec<Value> = snap
         .identity
         .nodes
         .values()
         .map(|n| {
             let r = snap.records.get(&n.label);
+            let hb = beats.get(&n.label);
             json!({
                 "label": n.label,
                 "name": n.label.name(&s.cfg.parent),
                 "owner": n.owner,
                 "stake": n.stake,
                 "active": snap.identity.node_active(&n.label),
+                "up": s.cfg.heartbeat_timeout == 0 || hb.is_some_and(|(at, h)| now.saturating_sub(*at) <= s.cfg.heartbeat_timeout && !h.drain),
+                "verified": s.verified_ip(&n.label, r.and_then(|r| r.ipv4)).is_some(),
+                "heartbeat": hb.map(|(at, h)| json!({ "age_s": now.saturating_sub(*at), "version": h.version, "classes": h.classes, "load_mbps": h.load_mbps })),
                 "signers": snap.identity.signers(&n.label),
                 "ipv4": r.and_then(|r| r.ipv4),
                 "ipv6": r.and_then(|r| r.ipv6),

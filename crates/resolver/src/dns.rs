@@ -229,7 +229,7 @@ impl Handler {
             };
             match qtype {
                 RecordType::A => {
-                    if let Some(ip) = rec.ipv4 {
+                    if let Some(ip) = self.state.verified_ip(&NodeId::new(label), rec.ipv4) {
                         a.records
                             .push(Record::from_rdata(name(qname), TTL_NODE, RData::A(A(ip))));
                     }
@@ -254,7 +254,7 @@ impl Handler {
         let account = AccountId::new(rel);
         let snap = self.state.snap.read().await;
         let Some(set) = snap.assignment.sets.get(&account) else {
-            return if self.state.accounts.iter().any(|x| x.id == account) {
+            return if self.state.accounts().iter().any(|x| x.id == account) {
                 a
             } else {
                 Answer::empty(ResponseCode::NXDomain)
@@ -264,11 +264,18 @@ impl Handler {
             a.authority.push(soa());
             return a;
         }
-        let mut live: Vec<(&NodeId, std::net::Ipv4Addr)> = set
-            .iter()
-            .filter(|n| snap.identity.node_active(n))
-            .filter_map(|n| snap.records.get(n).and_then(|r| r.ipv4).map(|ip| (n, ip)))
-            .collect();
+        let now = crate::state::unix_now();
+        let mut live: Vec<(&NodeId, std::net::Ipv4Addr)> = Vec::new();
+        for n in set.iter().filter(|n| snap.identity.node_active(n)) {
+            // a member without a fresh heartbeat is not answered (§4 step 3)
+            if !self.state.is_up(n, now).await {
+                continue;
+            }
+            // and only the endpoint that answered the challenge for this name (§6)
+            if let Some(ip) = self.state.verified_ip(n, snap.records.get(n).and_then(|r| r.ipv4)) {
+                live.push((n, ip));
+            }
+        }
         let point = self
             .state
             .geo
