@@ -7,7 +7,7 @@ use std::net::IpAddr;
 use std::sync::Arc;
 
 use dedan_core::geo;
-use dedan_core::map::GeoLocate;
+use dedan_core::map::{GeoLocate, MapParams};
 use dedan_core::token;
 use dedan_core::types::*;
 use hickory_proto::op::{Edns, Header, HeaderCounts, Metadata, ResponseCode};
@@ -288,32 +288,38 @@ impl Handler {
             .read()
             .expect("geo lock")
             .locate(&token::prefix(client));
-        let cell = point.and_then(|p| geo::cell(p).ok());
-        match cell.and_then(|c| snap.map.rank(c)) {
-            Some(rank) => {
-                let pos = |n: &NodeId| {
-                    rank.nodes
-                        .iter()
-                        .position(|(m, _)| m == n)
-                        .unwrap_or(usize::MAX)
-                };
-                live.sort_by(|(x, _), (y, _)| pos(x).cmp(&pos(y)).then_with(|| x.cmp(y)));
-            }
-            None => {
-                // cold start: nothing measured near the client, order by distance to the nodes' own locations
-                if let Some(p) = point {
-                    let km = |n: &NodeId| {
-                        snap.records
-                            .get(n)
-                            .and_then(|r| r.location)
-                            .map(|l| geo::distance_km(p, l))
-                            .unwrap_or(f64::MAX)
-                    };
-                    live.sort_by(|(x, _), (y, _)| km(x).total_cmp(&km(y)).then_with(|| x.cmp(y)));
+        // the client's cell answers with its own A records from ENS, lowest median first (DedanCells.dnsRecord);
+        // a cell with none of them live borrows the nearest cells that have, ring by ring
+        let mut answer: Vec<std::net::Ipv4Addr> = Vec::new();
+        if let Some(cell) = point.and_then(|p| geo::cell(p).ok()) {
+            for r in 0..=MapParams::v1().rings {
+                for c in geo::disk(cell, r) {
+                    for ip in snap.steer.get(&c).into_iter().flatten() {
+                        if live.iter().any(|(_, l)| l == ip) && !answer.contains(ip) {
+                            answer.push(*ip);
+                        }
+                    }
+                }
+                if !answer.is_empty() {
+                    break;
                 }
             }
         }
-        for (_, ip) in live.into_iter().take(ANSWERS) {
+        if answer.is_empty() {
+            // cold start: nothing measured near the client, order by distance to the nodes' own locations
+            if let Some(p) = point {
+                let km = |n: &NodeId| {
+                    snap.records
+                        .get(n)
+                        .and_then(|r| r.location)
+                        .map(|l| geo::distance_km(p, l))
+                        .unwrap_or(f64::MAX)
+                };
+                live.sort_by(|(x, _), (y, _)| km(x).total_cmp(&km(y)).then_with(|| x.cmp(y)));
+            }
+            answer = live.into_iter().map(|(_, ip)| ip).collect();
+        }
+        for ip in answer.into_iter().take(ANSWERS) {
             a.records
                 .push(Record::from_rdata(name(qname), TTL_STEER, RData::A(A(ip))));
         }

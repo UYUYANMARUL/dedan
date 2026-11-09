@@ -6,6 +6,9 @@ import {IERC165} from "@openzeppelin/contracts/utils/introspection/IERC165.sol";
 import {Strings} from "@openzeppelin/contracts/utils/Strings.sol";
 import {LibLabel} from "@ensdomains/contracts-v2/utils/LibLabel.sol";
 import {ITextResolver} from "@ens/contracts/resolvers/profiles/ITextResolver.sol";
+import {IDNSRecordResolver} from "@ens/contracts/resolvers/profiles/IDNSRecordResolver.sol";
+import {RRUtils} from "@ens/contracts/dnssec-oracle/RRUtils.sol";
+import {BytesUtils} from "@ens/contracts/utils/BytesUtils.sol";
 import {NameCoder} from "@ens/contracts/utils/NameCoder.sol";
 import {DedanRegistry} from "./DedanRegistry.sol";
 import {LibCell} from "./LibCell.sol";
@@ -16,10 +19,11 @@ import {LibCell} from "./LibCell.sol";
 ///         name also resolves as `<label>.<cell>.dedan.eth`. Nodes join the cells they serve. Verified humans
 ///         attest round trips to a cell's members, one batch per minute per cell; each human holds one vote per
 ///         node per cell (its newest sample), votes land in a per-day histogram of 8 ms buckets, and the median over
-///         today and yesterday is the cell's record for that node (ARCHITECTURE.md §6, §7).
+///         today and yesterday is the cell's record for that node (ARCHITECTURE.md §6, §7). The cell name's A/AAAA
+///         records are its members' own, lowest median first: what a Dedan nameserver answers a client in the cell.
 /// @dev Nothing here is trusted by money directly: the aggregator recomputes pay and evidence from the `Attested`
 ///      events; the histograms are what resolvers steer by, and any ENS client can read them as text records.
-contract DedanCells is ITextResolver, IERC1155Receiver {
+contract DedanCells is ITextResolver, IDNSRecordResolver, IERC1155Receiver {
     struct Sample {
         bytes32 labelHash;
         uint32 rttMs;
@@ -45,6 +49,10 @@ contract DedanCells is ITextResolver, IERC1155Receiver {
     uint64 public constant MIN_INTERVAL = 60;
 
     DedanRegistry public immutable REGISTRY;
+    /// @notice Votes a member needs before the cell's DNS records name it: 3 in production, 1 on the devnet.
+    uint32 public immutable MIN_VOTES;
+    /// @dev The parent name in DNS wire form (`\x05dedan\x03eth\x00`), to name the cell and its members.
+    bytes internal _parentDns;
 
     mapping(uint64 cell => uint256[] labelIds) internal _members;
     mapping(uint64 cell => mapping(uint256 labelId => uint32 index1)) internal _memberIndex;
@@ -81,8 +89,10 @@ contract DedanCells is ITextResolver, IERC1155Receiver {
     error NotRegistry();
     error BadCell(uint64 cell);
 
-    constructor(DedanRegistry registry) {
+    constructor(DedanRegistry registry, string memory parentName, uint32 minVotes) {
         REGISTRY = registry;
+        _parentDns = NameCoder.encode(parentName);
+        MIN_VOTES = minVotes;
     }
 
     // ---- membership ---------------------------------------------------------------------------
@@ -250,9 +260,25 @@ contract DedanCells is ITextResolver, IERC1155Receiver {
         return "";
     }
 
+    /// @notice ENSIP-6 on a cell name: the `resource` records (A, AAAA) of the members with at least `MIN_VOTES`
+    ///         votes, lowest median first (ties by label id), copied from each member's name and owned by the cell's.
+    /// @dev ponytail: insertion sort and one resolver call per member, fine for the tens of members a cell has.
+    ///      Members are read on the Dedan resolver only: a node that pointed its name at its own resolver is not
+    ///      listed here, and cannot make the cell's answer revert.
+    function dnsRecord(bytes32 node, bytes32 name, uint16 resource) external view returns (bytes memory out) {
+        uint64 cell = cellOfNode[node];
+        if (cell == 0) return "";
+        bytes memory owner = abi.encodePacked(uint8(15), LibCell.label(cell), _parentDns);
+        if (name != keccak256(owner)) return "";
+        (uint256[] memory ids, uint256 n) = _ranked(cell);
+        for (uint256 i; i < n; ++i) {
+            out = bytes.concat(out, _reowned(ids[i], resource, owner));
+        }
+    }
+
     function supportsInterface(bytes4 interfaceId) external pure returns (bool) {
-        return interfaceId == type(ITextResolver).interfaceId || interfaceId == type(IERC165).interfaceId
-            || interfaceId == type(IERC1155Receiver).interfaceId;
+        return interfaceId == type(ITextResolver).interfaceId || interfaceId == type(IDNSRecordResolver).interfaceId
+            || interfaceId == type(IERC165).interfaceId || interfaceId == type(IERC1155Receiver).interfaceId;
     }
 
     /// @dev The cell names are ERC-1155 tokens of the registry minted to this contract.
@@ -269,6 +295,35 @@ contract DedanCells is ITextResolver, IERC1155Receiver {
     }
 
     // ---- internals ----------------------------------------------------------------------------
+
+    /// @dev The first `n` of `ids`: the members with at least `MIN_VOTES` votes, lowest median first, ties by label id.
+    function _ranked(uint64 cell) internal view returns (uint256[] memory ids, uint256 n) {
+        uint256[] memory members = _members[cell];
+        ids = new uint256[](members.length);
+        uint32[] memory ms = new uint32[](members.length);
+        for (uint256 i; i < members.length; ++i) {
+            (uint32 m, uint32 votes) = median(cell, members[i]);
+            if (votes == 0 || votes < MIN_VOTES) continue;
+            uint256 j = n++;
+            for (; j > 0 && (ms[j - 1] > m || (ms[j - 1] == m && ids[j - 1] > members[i])); --j) {
+                (ms[j], ids[j]) = (ms[j - 1], ids[j - 1]);
+            }
+            (ms[j], ids[j]) = (m, members[i]);
+        }
+    }
+
+    /// @dev A member's `resource` records on the Dedan resolver: type, class, ttl and rdata kept, owner replaced.
+    function _reowned(uint256 labelId, uint16 resource, bytes memory owner) internal view returns (bytes memory out) {
+        string memory label = REGISTRY.LABEL_STORE().getLabel(labelId);
+        bytes memory own = abi.encodePacked(uint8(bytes(label).length), label, _parentDns);
+        bytes memory rrs = IDNSRecordResolver(address(REGISTRY.dedanResolver())).dnsRecord(
+            NameCoder.namehash(own, 0), keccak256(own), resource
+        );
+        for (RRUtils.RRIterator memory it = RRUtils.iterateRRs(rrs, 0); !RRUtils.done(it); RRUtils.next(it)) {
+            uint256 at = it.rdataOffset - 10;
+            out = bytes.concat(out, owner, BytesUtils.substring(rrs, at, it.nextOffset - at));
+        }
+    }
 
     function _drop(uint64 cell, uint256 labelId) internal {
         uint32 idx = _memberIndex[cell][labelId];

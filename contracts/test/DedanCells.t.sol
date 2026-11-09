@@ -12,11 +12,13 @@ import {LabelStore} from "@ensdomains/contracts-v2/utils/LabelStore.sol";
 import {IGatewayProvider} from "@ens/contracts/ccipRead/IGatewayProvider.sol";
 import {IAddrResolver} from "@ens/contracts/resolvers/profiles/IAddrResolver.sol";
 import {ITextResolver} from "@ens/contracts/resolvers/profiles/ITextResolver.sol";
+import {IDNSRecordResolver} from "@ens/contracts/resolvers/profiles/IDNSRecordResolver.sol";
 import {NameCoder} from "@ens/contracts/utils/NameCoder.sol";
 import {DedanCells} from "../src/DedanCells.sol";
 import {DedanRegistry} from "../src/DedanRegistry.sol";
 import {DedanResolver} from "../src/DedanResolver.sol";
 import {LibCell} from "../src/LibCell.sol";
+import {LibDnsWire} from "../src/LibDnsWire.sol";
 import {IWorldIDVerifier} from "../src/IWorldIDVerifier.sol";
 import {StubGatewayProvider} from "../src/StubGatewayProvider.sol";
 import {MockUSDC} from "../src/mocks/MockUSDC.sol";
@@ -30,6 +32,8 @@ contract DedanCellsTest is Test {
     // resolution-2 cells of Frankfurt and Istanbul (crates/core/examples/cell.rs)
     uint64 constant FRA_CELL = 586025403953446911;
     uint64 constant IST_CELL = 586010010790658047;
+    bytes4 constant FRA_IP = 0x0a4d1001; // 10.77.16.1
+    bytes4 constant IST_IP = 0x0a4d5001; // 10.77.80.1
 
     MockUSDC usdc;
     MockWorldID worldId;
@@ -60,7 +64,7 @@ contract DedanCellsTest is Test {
         dedan = new DedanRegistry(labelStore, gov, usdc, IWorldIDVerifier(address(worldId)), 1, "dedan.eth");
         resolver = new DedanResolver(IPermissionedRegistry(address(dedan)), "dedan.eth");
         dedan.setDedanResolver(resolver);
-        cells = new DedanCells(dedan);
+        cells = new DedanCells(dedan, "dedan.eth", 1);
         dedan.setCells(address(cells));
         root.register("eth", gov, IRegistry(address(eth)), address(0), LABEL_OWNER_ROLES, type(uint64).max);
         eth.setParent(IRegistry(address(root)), "eth");
@@ -81,8 +85,8 @@ contract DedanCellsTest is Test {
             vm.prank(ops[i]);
             usdc.approve(address(dedan), type(uint256).max);
         }
-        registerNode(op1, "fra");
-        registerNode(op2, "ist");
+        registerNode(op1, "fra", FRA_IP);
+        registerNode(op2, "ist", IST_IP);
         address[3] memory humans = [human1, human2, human3];
         for (uint256 i; i < humans.length; ++i) {
             vm.prank(humans[i]);
@@ -92,15 +96,17 @@ contract DedanCellsTest is Test {
 
     function proof(uint256 nullifier) internal pure returns (DedanRegistry.WorldIdProof memory p) {
         p.nullifier = nullifier;
+        p.issuerSchemaId = 1; // Proof of Human
     }
 
-    function registerNode(address op, string memory label) internal {
+    function registerNode(address op, string memory label, bytes4 ip) internal {
         vm.startPrank(op);
         dedan.registerOperator(proof(nextNullifier++));
         dedan.registerNode(label, new address[](0), 1_000e6);
         bytes32 node = dedan.nodeOf(label);
         resolver.setText(node, "dedan.class", "100M");
         resolver.setAddr(node, op);
+        resolver.setDNSRecords(node, LibDnsWire.a(NameCoder.encode(string.concat(label, ".dedan.eth")), 60, ip));
         vm.stopPrank();
     }
 
@@ -184,6 +190,41 @@ contract DedanCellsTest is Test {
         vm.prank(op1);
         vm.expectRevert(DedanRegistry.CellLabel.selector);
         dedan.registerNode("821faffffffffff", new address[](0), 1_000e6);
+    }
+
+    /// The cell's A records through the Universal Resolver, as the nameserver reads them.
+    function cellA(uint64 cell) internal view returns (bytes memory dns, bytes memory rrs) {
+        dns = NameCoder.encode(string.concat(LibCell.label(cell), ".dedan.eth"));
+        (bytes memory res,) =
+            ur.resolve(dns, abi.encodeCall(IDNSRecordResolver.dnsRecord, (NameCoder.namehash(dns, 0), keccak256(dns), 1)));
+        rrs = abi.decode(res, (bytes));
+    }
+
+    function test_cell_a_records_are_the_voted_members_lowest_median_first() public {
+        vm.prank(op1);
+        cells.join("fra", cellsOf(FRA_CELL));
+        vm.prank(op2);
+        cells.join("ist", cellsOf(FRA_CELL));
+        (bytes memory dns, bytes memory rrs) = cellA(FRA_CELL);
+        assertEq(rrs, "", "a member without votes is not answered");
+
+        vm.prank(human1);
+        cells.attest(FRA_CELL, one("fra", 40));
+        (, rrs) = cellA(FRA_CELL);
+        assertEq(rrs, LibDnsWire.a(dns, 60, FRA_IP), "the member's own record, under the cell's name");
+
+        DedanCells.Sample[] memory b = new DedanCells.Sample[](2);
+        b[0] = sample("fra", 40);
+        b[1] = sample("ist", 20);
+        vm.prank(human2);
+        cells.attest(FRA_CELL, b);
+        (, rrs) = cellA(FRA_CELL);
+        assertEq(rrs, bytes.concat(LibDnsWire.a(dns, 60, IST_IP), LibDnsWire.a(dns, 60, FRA_IP)), "lowest median first");
+
+        vm.prank(op2);
+        cells.leave("ist", cellsOf(FRA_CELL));
+        (, rrs) = cellA(FRA_CELL);
+        assertEq(rrs, LibDnsWire.a(dns, 60, FRA_IP), "a node that left is not answered");
     }
 
     function test_attest_rules_and_the_median() public {

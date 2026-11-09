@@ -1,0 +1,6 @@
+kyoto frankfurt 378
+kyoto tokyo 24
+kyoto seoul 42
+kyoto newyork 452
+kyoto istanbul 358
+kyoto osaka 10

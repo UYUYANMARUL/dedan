@@ -1,0 +1,1 @@
+{ "count": 1, "nodes": [ { "label": "hiroshima", "ip": "10.77.210.30", "location": "34.3853,132.4553", "cell": "586284888697602047", "attester": 94, "user": "user-hiroshima", "kind": "client" } ] }

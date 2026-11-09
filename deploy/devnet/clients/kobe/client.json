@@ -1,0 +1,1 @@
+{ "count": 1, "nodes": [ { "label": "kobe", "ip": "10.77.207.30", "location": "34.6901,135.1955", "cell": "586284888697602047", "attester": 91, "user": "user-kobe", "kind": "client" } ] }

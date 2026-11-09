@@ -16,6 +16,7 @@ import {DedanRegistry} from "../src/DedanRegistry.sol";
 import {DedanResolver} from "../src/DedanResolver.sol";
 import {IWorldIDVerifier} from "../src/IWorldIDVerifier.sol";
 import {Settlement} from "../src/Settlement.sol";
+import {WorldIdGate} from "../src/WorldIdGate.sol";
 import {StubGatewayProvider} from "../src/StubGatewayProvider.sol";
 import {MockUSDC} from "../src/mocks/MockUSDC.sol";
 import {MockWorldID} from "../src/mocks/MockWorldID.sol";
@@ -37,6 +38,7 @@ contract Deploy is Script {
 
     MockUSDC usdc;
     MockWorldID worldId;
+    WorldIdGate worldIdGate;
     LabelStore labelStore;
     PermissionedRegistry root;
     PermissionedRegistry eth;
@@ -59,6 +61,9 @@ contract Deploy is Script {
         vm.startBroadcast(govPk);
         usdc = new MockUSDC();
         worldId = new MockWorldID();
+        // real humans: IDKit proofs the control plane verified at the Developer Portal and attests (WORLD-ID.md);
+        // the mock stays as the fallback for the devnet's scripted humans, who hold no World ID
+        worldIdGate = new WorldIdGate(gov, controlPlane, worldId);
         deployEns(gov);
         deploySettlement(gov, aggregator, countersigner, controlPlane);
         for (uint32 i = 0; i < 60; i++) {
@@ -84,10 +89,12 @@ contract Deploy is Script {
         labelStore = new LabelStore(IContractNamer(address(0)));
         root = new PermissionedRegistry(labelStore, gov, TLD_GOV_ROLES);
         eth = new PermissionedRegistry(labelStore, gov, TLD_GOV_ROLES);
-        dedan = new DedanRegistry(labelStore, gov, usdc, IWorldIDVerifier(address(worldId)), 1, "dedan.eth");
+        // the relying party's numeric id (`rp_<16 hex>` in the Developer Portal); only the real WorldIDVerifier checks it
+        uint64 rpId = uint64(vm.envOr("WORLD_ID_RP_ID_U64", uint256(1)));
+        dedan = new DedanRegistry(labelStore, gov, usdc, IWorldIDVerifier(address(worldIdGate)), rpId, "dedan.eth");
         resolver = new DedanResolver(IPermissionedRegistry(address(dedan)), "dedan.eth");
         dedan.setDedanResolver(resolver);
-        cells = new DedanCells(dedan);
+        cells = new DedanCells(dedan, "dedan.eth", 1); // one vote names a node on the devnet (one human per city)
         dedan.setCells(address(cells));
         root.register("eth", gov, IRegistry(address(eth)), address(0), LABEL_OWNER_ROLES, type(uint64).max);
         eth.setParent(IRegistry(address(root)), "eth");
@@ -141,6 +148,7 @@ contract Deploy is Script {
         vm.serializeUint(j, "chainId", block.chainid);
         vm.serializeAddress(j, "usdc", address(usdc));
         vm.serializeAddress(j, "worldId", address(worldId));
+        vm.serializeAddress(j, "worldIdGate", address(worldIdGate));
         vm.serializeAddress(j, "labelStore", address(labelStore));
         vm.serializeAddress(j, "rootRegistry", address(root));
         vm.serializeAddress(j, "ethRegistry", address(eth));

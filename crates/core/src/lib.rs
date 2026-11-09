@@ -20,5 +20,6 @@ pub mod score;
 pub mod settlement;
 pub mod token;
 pub mod types;
+pub mod worldid;
 
 pub use alloy::primitives::{Address, B256, U256};

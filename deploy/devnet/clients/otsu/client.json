@@ -1,0 +1,1 @@
+{ "count": 1, "nodes": [ { "label": "otsu", "ip": "10.77.4.30", "location": "35.0045,135.8686", "cell": "586284338941788159", "attester": 48, "user": "user-otsu", "kind": "client" } ] }

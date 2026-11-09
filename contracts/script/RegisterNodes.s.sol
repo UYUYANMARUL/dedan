@@ -109,6 +109,7 @@ contract RegisterNodes is Script {
 
     function proof(uint256 nullifier) internal pure returns (DedanRegistry.WorldIdProof memory p) {
         p.nullifier = nullifier;
+        p.issuerSchemaId = 1; // Proof of Human
     }
 
     /// "10.77.0.11" → 0x0a4d000b

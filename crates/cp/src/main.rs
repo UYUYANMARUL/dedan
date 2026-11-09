@@ -57,6 +57,8 @@ type Error = Box<dyn std::error::Error + Send + Sync>;
 /// its whole cache dropped); persist the log next to the configs if restarts become frequent.
 const LOG_LEN: usize = 1_000;
 
+mod worldid;
+
 fn unix_now() -> u64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -211,6 +213,8 @@ struct Cp {
     /// Orders run one at a time: the members of one account share the `_acme-challenge` name.
     acme_lock: Mutex<()>,
     http: reqwest::Client,
+    /// The World ID relying party: signed IDKit requests, verified results (WORLD-ID.md).
+    world_id: worldid::WorldId,
 }
 
 impl Cp {
@@ -642,6 +646,7 @@ async fn main() -> Result<(), Error> {
         acme,
         acme_lock: Mutex::new(()),
         http: reqwest::Client::builder().timeout(Duration::from_secs(10)).build()?,
+        world_id: worldid::WorldId::from_env(),
     });
     if let Err(e) = cp.refresh().await {
         warn!(error = %e, "first identity refresh failed");
@@ -662,6 +667,9 @@ async fn main() -> Result<(), Error> {
         .route("/v1/stream", get(stream))
         .route("/v1/purge", post(purge))
         .route("/v1/certs", post(certs))
+        .route("/v1/world-id/config", get(worldid::config))
+        .route("/v1/world-id/request", post(worldid::request))
+        .route("/v1/world-id/verify", post(worldid::verify))
         .with_state(cp.clone());
     let listener = tokio::net::TcpListener::bind(&cp.cfg.listen).await?;
     info!(listen = %cp.cfg.listen, me = %cp.key.address(), "control plane listening");

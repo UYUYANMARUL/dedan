@@ -88,6 +88,7 @@ x-chain-env: &chain-env
   DEDAN_MAP_K: "1" # one human per city on the devnet; the code's default is the documented 3
   DEDAN_CP_URL: http://cp:8070 # the account-signed configs the control plane relays
   DEDAN_AUDITORS_PER_ACCOUNT: "10" # every staked auditor of the devnet probes acme; the default is 5 per account
+  DEDAN_ATTESTATION_TOKEN_MAX_AGE_MIN: "10080" # the chain clock jumps days ahead (smoke, dispute windows); 10 in production
   RUST_LOG: info
 
 x-chain-volumes: &chain-volumes
@@ -163,6 +164,7 @@ services:
       DEDAN_MAP_K: "1"
       DEDAN_PERIOD_SECS: "120" # prices a period for the balance check: an account needs 4 periods of list price
       DEDAN_AGGREGATOR_URL: http://aggregator:8060 # the published period the sets are sticky on (settlement profile)
+      DEDAN_ATTESTATION_TOKEN_MAX_AGE_MIN: "10080" # the chain clock jumps days ahead on the devnet; 10 in production
       RUST_LOG: info
     volumes:
       - ../contracts/deployments:/deployments:ro
@@ -192,6 +194,11 @@ services:
   cp:
     image: dedan-services:local
     command: ["dedan-cp"]
+    # the World ID app from the Developer Portal (WORLD-ID.md): DEDAN_WORLD_ID_APP_ID, _RP_ID, _SIGNING_KEY, _ENV;
+    # without the file the control plane runs and World ID stays off (roles only through the devnet mock)
+    env_file:
+      - path: ./devnet/world-id.env
+        required: false
     environment:
       DEDAN_RPC_URL: http://anvil:8545
       DEDAN_DEPLOYMENT: /deployments/devnet.json
@@ -209,7 +216,7 @@ services:
       - pebble-certs:/pebble-certs:ro
       - cp-data:/data # the accepted configs and the event seq, kept across restarts
     ports:
-      - "8070:8070" # /health, /v1/configs (GET, POST), /v1/stream, POST /v1/purge, POST /v1/certs
+      - "8070:8070" # /health, /v1/configs (GET, POST), /v1/stream, POST /v1/purge, POST /v1/certs, /v1/world-id/*
     healthcheck:
       test: ["CMD", "curl", "-sf", "http://127.0.0.1:8070/health"]
       interval: 2s
@@ -534,6 +541,7 @@ services:
     working_dir: ${PWD} # the repo at its host path, so compose bind mounts made from inside resolve on the host
     environment:
       NS_API: http://resolver:8055
+      CP_API: http://cp:8070 # World ID requests and verification
       DOZZLE_URL: http://localhost:9999
     volumes:
       - ${PWD}:${PWD}

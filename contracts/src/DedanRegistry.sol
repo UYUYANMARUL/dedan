@@ -100,6 +100,7 @@ contract DedanRegistry is PermissionedRegistry {
     error AlreadyRevealed();
     error RevealTooEarly();
     error LabelCooling();
+    error NotProofOfHuman();
 
     constructor(
         ILabelStore labelStore,
@@ -392,7 +393,10 @@ contract DedanRegistry is PermissionedRegistry {
         return _getRoles(_humanResource(account), account) & role != 0;
     }
 
+    /// @dev Every role here rests on one human, one account: only the Proof of Human credential (schema 1, the
+    ///      Orb) proves uniqueness; a Selfie Check or document proof would let one person hold many.
     function _verifyHuman(uint256 action, WorldIdProof calldata p) internal {
+        if (p.issuerSchemaId != 1) revert NotProofOfHuman();
         if (nullifierUsed[action][p.nullifier]) revert NullifierUsed();
         worldId.verify(
             p.nullifier,

@@ -1,0 +1,1 @@
+{ "count": 1, "nodes": [ { "label": "gifu", "ip": "10.77.5.30", "location": "35.4233,136.7607", "cell": "586284338941788159", "attester": 49, "user": "user-gifu", "kind": "client" } ] }

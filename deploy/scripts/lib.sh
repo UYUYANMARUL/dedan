@@ -43,12 +43,14 @@ cast() { $COMPOSE run --rm -T deployer "cast $*"; }
 private_key() { cast wallet private-key "\"$MNEMONIC\"" --mnemonic-index "$1" | tr -d '\r\n'; }
 address_of() { cast wallet address --mnemonic "\"$MNEMONIC\"" --mnemonic-index "$1" | tr -d '\r\n'; }
 is_attester() { cast call "$(registry)" "\"isAttester(address)(bool)\"" "$1" --rpc-url http://anvil:8545 | tr -d '\r\n'; }
-# World ID mock: any proof with a non-zero nullifier passes; the nullifier is burned per action, so one per human
-register_attester() { cast send "$(registry)" "\"registerAttester((uint256,uint256,uint64,uint64,uint256,uint256[5]))\"" "\"($2,0,0,0,0,[0,0,0,0,0])\"" --private-key "$(private_key "$1")" --rpc-url http://anvil:8545 >/dev/null; }
+# World ID mock (the devnet's scripted humans; real humans go through WORLD-ID.md): a Proof of Human (schema 1)
+# proof with any non-zero nullifier passes; the nullifier is burned per action, so one per human
+register_attester() { cast send "$(registry)" "\"registerAttester((uint256,uint256,uint64,uint64,uint256,uint256[5]))\"" "\"($2,0,0,1,0,[0,0,0,0,0])\"" --private-key "$(private_key "$1")" --rpc-url http://anvil:8545 >/dev/null; }
 hex() { printf '0x%s' "$(printf '%s' "$1" | xxd -p | tr -d '\n')"; }
-# average round trip in ms from container $1 (a city or user-<city>) to ip $2; 9999 when unreachable
+# minimum round trip in ms from container $1 (a city or user-<city>) to ip $2, as an attestation keeps it (jitter only
+# ever adds delay, so the fastest of three is the closest to the path); 9999 when unreachable
 ping_rtt() {
-  r=$(docker exec -i "dedan-devnet-$1-1" ping -c 3 -i 0.2 -q "$2" 2>/dev/null | awk -F'/' '/round-trip|rtt/ {printf "%.0f", $4}')
+  r=$(docker exec -i "dedan-devnet-$1-1" ping -c 3 -i 0.2 -q "$2" 2>/dev/null | awk -F' = ' '/round-trip|rtt/ {split($2, t, "/"); printf "%.0f", t[1]}')
   printf '%s' "${r:-9999}"
 }
 # the X-Dedan-Node token the node at $2 mints for the user in city $1; one retry, since a transient miss must not

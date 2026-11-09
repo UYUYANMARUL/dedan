@@ -32,6 +32,15 @@ pub struct MapParams {
     /// The contract's histogram: `buckets` buckets of `bucket_ms` each, the last one open-ended.
     pub bucket_ms: u32,
     pub buckets: usize,
+    /// How long after its minute a token may back an attestation, against the block's time. The devnet jumps
+    /// its chain clock days ahead to pass the dispute window while the nodes mint on the wall clock, so it
+    /// widens this; production block time tracks the wall clock.
+    #[serde(default = "default_token_max_age_min")]
+    pub token_max_age_min: u64,
+}
+
+fn default_token_max_age_min() -> u64 {
+    TOKEN_MAX_AGE_MIN
 }
 
 impl MapParams {
@@ -46,6 +55,7 @@ impl MapParams {
             anchor_clamp_ms: 50,
             bucket_ms: 8,
             buckets: 32,
+            token_max_age_min: TOKEN_MAX_AGE_MIN,
         }
     }
 
@@ -132,9 +142,9 @@ pub enum TokenStatus {
 
 /// Verifies a fetch token for a node against the key that node revealed, at the time it was reported.
 pub trait TokenCheck {
-    /// `token` names `node`, was minted within [`TOKEN_MAX_AGE_MIN`] minutes before `at` (the result's or the
-    /// block's time) and its MAC verifies against the key `node` revealed for that hour.
-    fn check(&self, token: &str, node: &NodeId, at: u64) -> TokenStatus;
+    /// `token` names `node`, was minted at most `max_age_min` minutes before `at` (the result's or the block's
+    /// time, [`TOKEN_MAX_AGE_MIN`] normally) and its MAC verifies against the key `node` revealed for that hour.
+    fn check(&self, token: &str, node: &NodeId, at: u64, max_age_min: u64) -> TokenStatus;
 }
 
 /// The network inside a token (`10.77.16.0/24`), what the location check places; empty when malformed.
@@ -178,13 +188,13 @@ impl RevealSet {
 }
 
 impl TokenCheck for RevealSet {
-    fn check(&self, token: &str, node: &NodeId, at: u64) -> TokenStatus {
+    fn check(&self, token: &str, node: &NodeId, at: u64, max_age_min: u64) -> TokenStatus {
         let Ok(t) = token.parse::<Token>() else {
             return TokenStatus::Invalid;
         };
         let now_min = token::minute_of(at);
         if &t.node_id != node
-            || t.minute + TOKEN_MAX_AGE_MIN < now_min
+            || t.minute + max_age_min < now_min
             || t.minute > now_min + TOKEN_MAX_AHEAD_MIN
         {
             return TokenStatus::Invalid;
@@ -240,7 +250,10 @@ impl<'a> Validator<'a> {
             ts: a.ts,
             reason,
         };
-        match self.tokens.check(&a.token, &a.node_id, a.ts) {
+        match self
+            .tokens
+            .check(&a.token, &a.node_id, a.ts, self.params.token_max_age_min)
+        {
             TokenStatus::Valid => {}
             TokenStatus::Invalid => return Err(reject(Rejection::BadToken)),
             TokenStatus::NoKey => return Err(reject(Rejection::Unverifiable)),
@@ -727,7 +740,7 @@ mod tests {
     /// Accepts any well-formed token except the ones [`tok`] marks bad; the network inside is what counts.
     struct AcceptOk;
     impl TokenCheck for AcceptOk {
-        fn check(&self, token: &str, _: &NodeId, _: u64) -> TokenStatus {
+        fn check(&self, token: &str, _: &NodeId, _: u64, _: u64) -> TokenStatus {
             match token.parse::<Token>() {
                 Ok(t) if t.mac != [0xbb; 32] => TokenStatus::Valid,
                 _ => TokenStatus::Invalid,
@@ -876,22 +889,28 @@ mod tests {
         assert_eq!(evidence.len(), 2);
         assert!(matches!(evidence[0].reason, Rejection::UnknownNode));
         assert!(matches!(evidence[1].reason, Rejection::BadToken));
-        assert_eq!(reveals.check(&good, &node("fra"), TS), TokenStatus::Valid);
+        let age = TOKEN_MAX_AGE_MIN;
+        assert_eq!(reveals.check(&good, &node("fra"), TS, age), TokenStatus::Valid);
         let moved = good.replace(".0a4d00.", ".0a4d01.");
         assert_eq!(
-            reveals.check(&moved, &node("fra"), TS),
+            reveals.check(&moved, &node("fra"), TS, age),
             TokenStatus::Invalid,
             "another network, the same MAC"
         );
         assert_eq!(
-            reveals.check(&good, &node("fra"), TS + 11 * 60),
+            reveals.check(&good, &node("fra"), TS + 11 * 60, age),
             TokenStatus::Invalid,
             "a token older than ten minutes backs nothing"
         );
-        assert_eq!(reveals.check(&good, &node("tok"), TS), TokenStatus::Invalid, "another node's token");
+        assert_eq!(
+            reveals.check(&good, &node("fra"), TS + 11 * 60, 3 * 24 * 60),
+            TokenStatus::Valid,
+            "unless the window is widened (the devnet's jumping chain clock)"
+        );
+        assert_eq!(reveals.check(&good, &node("tok"), TS, age), TokenStatus::Invalid, "another node's token");
         let unrevealed = token::mint(&node("fra"), token::minute_of(TS + 7_200), &k.0, IST_PREFIX).to_string();
         assert_eq!(
-            reveals.check(&unrevealed, &node("fra"), TS + 7_200),
+            reveals.check(&unrevealed, &node("fra"), TS + 7_200, age),
             TokenStatus::NoKey,
             "no key for that hour: the node's loss, not a forgery"
         );
@@ -901,7 +920,7 @@ mod tests {
             hour: token::hour_of(TS),
             k_hour: B256::from([7u8; 32]),
         });
-        assert_eq!(reveals.check(&good, &node("fra"), TS), TokenStatus::Valid);
+        assert_eq!(reveals.check(&good, &node("fra"), TS, age), TokenStatus::Valid);
     }
 
     #[test]

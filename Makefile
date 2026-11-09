@@ -66,6 +66,9 @@ add-client: ## add a client (a human's device) at a location: make add-client LA
 e2e: ## the traffic path: account-signed configs, certificates through the control plane, HTTPS miss then hit with a token, purge, stale on origin failure and while revalidating, 421, a forged endpoint not served
 	sh deploy/scripts/e2e.sh
 
+worldid-check: ## World ID on a running devnet with a stand-in for the Developer Portal's answer: RP-signed request, the control plane's checks and attestation, the gate, the role on chain; one per human, Proof of Human only, the signal is the account, a request answers once
+	sh deploy/scripts/worldid-check.sh
+
 demo-settlement: ## fresh devnet: the settlement loop (city auditors, aggregator, countersigner) with a tampered node, a dead node, a spoofing attester and a lying auditor; report, recompute, void, claim
 	sh deploy/scripts/demo-settlement.sh
 

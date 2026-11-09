@@ -1,0 +1,8 @@
+fukuoka frankfurt 372
+fukuoka tokyo 44
+fukuoka seoul 30
+fukuoka newyork 464
+fukuoka istanbul 348
+fukuoka osaka 28
+fukuoka kyoto 30
+fukuoka nagoya 34

@@ -196,6 +196,7 @@ contract Smoke is Script {
 
     function _proof(uint256 nullifier) internal pure returns (DedanRegistry.WorldIdProof memory p) {
         p.nullifier = nullifier;
+        p.issuerSchemaId = 1; // Proof of Human
     }
 
     function _sign(uint256 pk, bytes32 d) internal pure returns (bytes memory) {

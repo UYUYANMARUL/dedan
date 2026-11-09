@@ -1,0 +1,7 @@
+nagoya frankfurt 380
+nagoya tokyo 20
+nagoya seoul 46
+nagoya newyork 450
+nagoya istanbul 362
+nagoya osaka 14
+nagoya kyoto 14

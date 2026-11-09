@@ -22,6 +22,8 @@ import {IWorldIDVerifier} from "../src/IWorldIDVerifier.sol";
 import {StubGatewayProvider} from "../src/StubGatewayProvider.sol";
 import {MockUSDC} from "../src/mocks/MockUSDC.sol";
 import {MockWorldID} from "../src/mocks/MockWorldID.sol";
+import {WorldIdGate} from "../src/WorldIdGate.sol";
+import {MessageHashUtils} from "@openzeppelin/contracts/utils/cryptography/MessageHashUtils.sol";
 
 contract DedanRegistryTest is Test {
     uint256 constant TLD_GOV_ROLES = RegistryRolesLib.ROLE_REGISTRAR | RegistryRolesLib.ROLE_REGISTRAR_ADMIN
@@ -84,6 +86,7 @@ contract DedanRegistryTest is Test {
 
     function proof(uint256 nullifier) internal pure returns (DedanRegistry.WorldIdProof memory p) {
         p.nullifier = nullifier;
+        p.issuerSchemaId = 1; // Proof of Human
     }
 
     /// The records an owner writes after registration, as one resolver multicall.
@@ -145,6 +148,91 @@ contract DedanRegistryTest is Test {
         assertTrue(dedan.isOperator(op1));
         assertTrue(dedan.isAttester(op1));
         assertFalse(dedan.isOperator(stranger));
+    }
+
+    /// Only the Proof of Human credential grants a role: a Selfie Check (11) or passport (9303) proof does not.
+    function test_only_proof_of_human_grants_a_role() public {
+        DedanRegistry.WorldIdProof memory p = proof(77);
+        p.issuerSchemaId = 11;
+        vm.prank(attester);
+        vm.expectRevert(DedanRegistry.NotProofOfHuman.selector);
+        dedan.registerAttester(p);
+        p.issuerSchemaId = 9303;
+        vm.prank(attester);
+        vm.expectRevert(DedanRegistry.NotProofOfHuman.selector);
+        dedan.registerAttester(p);
+        p.issuerSchemaId = 1;
+        vm.prank(attester);
+        dedan.registerAttester(p);
+        assertTrue(dedan.isAttester(attester));
+    }
+
+    /// The real path: the control plane verified the IDKit proof at the Developer Portal and attests it for this
+    /// registry, this account and this action; the registry burns the nullifier.
+    function test_gate_accepts_the_registrar_attestation_once() public {
+        (address registrar, uint256 registrarPk) = makeAddrAndKey("registrar");
+        WorldIdGate gate = new WorldIdGate(gov, registrar, IWorldIDVerifier(address(0)));
+        vm.prank(gov);
+        dedan.setWorldId(gate, 42);
+        DedanRegistry.WorldIdProof memory p = attested(gate, registrarPk, attester, dedan.ACTION_ATTESTER(), 0xbeef);
+        vm.prank(stranger);
+        vm.expectRevert(); // the attestation names the attester's signal, not the stranger's
+        dedan.registerAttester(p);
+        vm.prank(attester);
+        vm.expectRevert(); // bound to the attester action, not the auditor one
+        dedan.registerAuditor(p, 100e6);
+        vm.prank(attester);
+        dedan.registerAttester(p);
+        assertTrue(dedan.isAttester(attester));
+        vm.prank(attester);
+        vm.expectRevert(DedanRegistry.NullifierUsed.selector); // one human, one attester key
+        dedan.registerAttester(p);
+        // a forged attestation and one past its deadline fail; with no fallback nothing else passes
+        (, uint256 otherPk) = makeAddrAndKey("not-the-registrar");
+        DedanRegistry.WorldIdProof memory forged = attested(gate, otherPk, auditor, dedan.ACTION_ATTESTER(), 0xcafe);
+        vm.prank(auditor);
+        vm.expectRevert(WorldIdGate.NotAttested.selector);
+        dedan.registerAttester(forged);
+        DedanRegistry.WorldIdProof memory late = attested(gate, registrarPk, auditor, dedan.ACTION_ATTESTER(), 0xcafe);
+        vm.warp(block.timestamp + 2 hours);
+        vm.prank(auditor);
+        vm.expectRevert(WorldIdGate.AttestationExpired.selector);
+        dedan.registerAttester(late);
+    }
+
+    /// The devnet's scripted humans pass through the fallback; turning it off leaves only attested proofs.
+    function test_gate_fallback_is_governance_switched() public {
+        (address registrar,) = makeAddrAndKey("registrar");
+        WorldIdGate gate = new WorldIdGate(gov, registrar, worldId);
+        vm.prank(gov);
+        dedan.setWorldId(gate, 1);
+        vm.prank(attester);
+        dedan.registerAttester(proof(501));
+        vm.prank(gov);
+        gate.setFallback(IWorldIDVerifier(address(0)));
+        vm.prank(auditor);
+        vm.expectRevert(WorldIdGate.NotAttested.selector);
+        dedan.registerAttester(proof(502));
+    }
+
+    /// What the control plane returns after verifying at the Developer Portal: the proof's public inputs and
+    /// its signature over them in the proof words, `[r, s, v, deadline, 0]`.
+    function attested(WorldIdGate gate, uint256 pk, address account, uint256 action, uint256 nullifier)
+        internal
+        view
+        returns (DedanRegistry.WorldIdProof memory p)
+    {
+        p.nullifier = nullifier;
+        p.nonce = 0x1234;
+        p.expiresAtMin = uint64(block.timestamp + 365 days);
+        p.issuerSchemaId = 1;
+        uint256 deadline = block.timestamp + 1 hours;
+        bytes32 d = gate.attestationDigest(
+            address(dedan), nullifier, action, dedan.worldIdRpId(), p.nonce, dedan.signalHash(account),
+            p.expiresAtMin, 1, 0, deadline
+        );
+        (uint8 v, bytes32 r, bytes32 s_) = vm.sign(pk, MessageHashUtils.toEthSignedMessageHash(d));
+        p.proof = [uint256(r), uint256(s_), uint256(v), deadline, 0];
     }
 
     function test_registerNode_mints_the_name_grants_the_signer_and_records_resolve() public {

@@ -59,6 +59,7 @@ struct Cfg {
     sample_n: usize,
     map_k: usize,
     auditors_per_account: usize,
+    attestation_token_max_age_min: u64,
     listen: String,
     countersigner: String,
 }
@@ -78,6 +79,7 @@ impl Cfg {
             sample_n: get("DEDAN_SAMPLE_N", "4").parse()?,
             map_k: get("DEDAN_MAP_K", "3").parse()?,
             auditors_per_account: get("DEDAN_AUDITORS_PER_ACCOUNT", "5").parse()?,
+            attestation_token_max_age_min: get("DEDAN_ATTESTATION_TOKEN_MAX_AGE_MIN", "10").parse()?,
             listen: get("DEDAN_LISTEN", default_listen),
             countersigner: get("DEDAN_COUNTERSIGNER", "http://countersigner:8061"),
         })
@@ -314,6 +316,7 @@ impl App {
             sample_n: self.cfg.sample_n,
             map_k: self.cfg.map_k,
             auditors_per_account: self.cfg.auditors_per_account,
+            attestation_token_max_age_min: self.cfg.attestation_token_max_age_min,
             prev_outputs_hash,
             files: BTreeMap::new(),
         };
@@ -335,6 +338,8 @@ impl App {
             std::fs::remove_dir_all(&dir)?;
         }
         inputs.write(&dir)?;
+        // compute from exactly the bytes that are published, as the countersigner and `recompute` will
+        let inputs = Inputs::read(&dir)?;
         let out = settle::compute(&inputs, Inputs::inputs_hash(&dir)?)?;
         out.write(&dir)?;
         info!(

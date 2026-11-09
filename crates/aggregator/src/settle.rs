@@ -54,12 +54,19 @@ pub struct Manifest {
     /// Auditors the schedule assigns per account; results from the others are not scored.
     #[serde(default = "default_auditors_per_account")]
     pub auditors_per_account: usize,
+    /// How long a token may back an attestation after its minute, against the block's time (`MapParams`).
+    #[serde(default = "default_token_age")]
+    pub attestation_token_max_age_min: u64,
     pub prev_outputs_hash: String,
     pub files: BTreeMap<String, String>,
 }
 
 fn default_auditors_per_account() -> usize {
     5
+}
+
+fn default_token_age() -> u64 {
+    map::TOKEN_MAX_AGE_MIN
 }
 
 /// A tier's daily list price in the on-chain table at `registry_block`, micro-USDC.
@@ -360,7 +367,8 @@ pub fn compute(inp: &Inputs, inputs_hash: B256) -> Result<Outputs, Error> {
                 .and_then(|t| t.parse::<Token>().ok())
                 .map(|t| t.node_id);
             let status = match (&served_by, &r.token) {
-                (Some(node), Some(t)) => reveals.check(t, node, r.ts),
+                // the result's time and the token's minute are both wall clocks: the fixed window
+                (Some(node), Some(t)) => reveals.check(t, node, r.ts, map::TOKEN_MAX_AGE_MIN),
                 _ => TokenStatus::Invalid,
             };
             // the node never revealed that hour's key: the result proves nothing either way, and it is the
@@ -400,6 +408,7 @@ pub fn compute(inp: &Inputs, inputs_hash: B256) -> Result<Outputs, Error> {
     //    this period's paid attestations and rejections
     let params = MapParams {
         k_min: m.map_k,
+        token_max_age_min: m.attestation_token_max_age_min,
         ..MapParams::v1()
     };
     let map = Map::from_votes(
@@ -758,6 +767,7 @@ mod tests {
                 sample_n: 4,
                 map_k: 1,
                 auditors_per_account: 5,
+                attestation_token_max_age_min: 10,
                 prev_outputs_hash: String::new(),
                 files: BTreeMap::new(),
             },
@@ -800,6 +810,21 @@ mod tests {
         assert!(reasons.iter().any(|r| r.contains("outside the period")));
         assert_eq!(out.score.multipliers[&acme].list, 10_000_000, "the account's own config, priced on chain");
         assert!(out.bill_leaves.iter().any(|l| l.who == acme));
+    }
+
+    /// The previous state travels through JSON (`next.json` becomes the next period's `prev.json`): a float
+    /// that does not read back exactly makes the countersigner's recomputation differ (serde_json needs
+    /// `float_roundtrip` for exact parsing).
+    #[test]
+    fn prev_state_round_trips_through_json_exactly() {
+        let q = 0.9422800000000001_f64;
+        let prev = Prev {
+            quality: vec![(AccountId::new("acme"), NodeId::new("newyork"), q)],
+            ..Prev::default()
+        };
+        let back: Prev = serde_json::from_slice(&serde_json::to_vec_pretty(&prev).unwrap()).unwrap();
+        assert_eq!(back, prev);
+        assert_eq!(back.quality[0].2.to_bits(), q.to_bits());
     }
 
     #[test]

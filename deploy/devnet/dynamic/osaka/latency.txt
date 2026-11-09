@@ -1,0 +1,5 @@
+osaka frankfurt 378
+osaka tokyo 24
+osaka seoul 42
+osaka newyork 454
+osaka istanbul 358

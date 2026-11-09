@@ -3,15 +3,20 @@
 logs, a terminal per container (Dozzle), "add a node at a location" (deploy/scripts/add-node.sh), and a client's
 attestation flow: verify a human through the World ID mock (deploy/scripts/human.sh), then measure nodes from that
 city's user container and submit the batch to the contract (deploy/scripts/attest.sh).
-Endpoints: GET / (page), GET /api/state, GET /api/logs/<container>?tail=200, GET /api/jobs/<id>, and the jobs
+The page is a Next.js static export (web/, built into web/out by the Dockerfile) served for every path outside /api.
+Endpoints: GET /api/state, GET /api/logs/<container>?tail=200, GET /api/jobs/<id>, and the jobs
 (202 with a job id): POST /clients {label, lat, lon} (a human's device; deploy/scripts/add-client.sh), POST /nodes
 {label, lat, lon} (a CDN node with a local human), POST /api/worldid {city, index?}, POST /api/attest {city, index?,
-nodes?}. Stdlib only."""
+nodes?}. World ID (real, WORLD-ID.md): GET /api/worldid/config, GET /api/worldid/account?index=N, POST
+/api/worldid/request {role}, POST /api/worldid/verify {role, index, result} (the control plane verifies at the
+Developer Portal, then a job submits the registration). Stdlib only."""
 import glob
 import json
+import mimetypes
 import os
 import subprocess
 import threading
+import urllib.error
 import urllib.parse
 import urllib.request
 import uuid
@@ -19,8 +24,10 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 NS_API = os.environ.get("NS_API", "http://127.0.0.1:8055")
 AGG_API = os.environ.get("AGG_API", "http://aggregator:8060")  # the settlement loop, when its compose profile is up
+CP_API = os.environ.get("CP_API", "http://cp:8070")  # the control plane: World ID requests and verification
 DOZZLE = os.environ.get("DOZZLE_URL", "http://localhost:9999")
 ROOT = os.path.dirname(os.path.abspath(__file__))
+WEB = os.path.join(ROOT, "web", "out")  # the Next.js export
 jobs = {}  # id -> {label, status, log}
 
 
@@ -43,6 +50,27 @@ def settlement_report(period):
     out = subprocess.run(["docker", "compose", "--progress", "quiet", "-f", "deploy/docker-compose.yml", "--profile", "settlement", "exec", "-T",
                           "aggregator", "dedan-aggregator", "report", f"/data/periods/{int(period)}"], capture_output=True, text=True)
     return out.stdout + out.stderr
+
+
+def cp(path, body=None):
+    """(status, json) from the control plane; its error answers are JSON too."""
+    req = urllib.request.Request(CP_API + path, data=None if body is None else json.dumps(body).encode(),
+                                 headers={"content-type": "application/json"}, method="GET" if body is None else "POST")
+    try:
+        with urllib.request.urlopen(req, timeout=30) as r:
+            return r.status, json.load(r)
+    except urllib.error.HTTPError as e:
+        try:
+            return e.code, json.load(e)
+        except Exception:
+            return e.code, {"error": str(e)}
+    except Exception as e:
+        return 502, {"error": f"control plane unreachable: {e}"}
+
+
+def address_of(index):
+    out = subprocess.run(["sh", "-c", f". deploy/scripts/lib.sh && address_of {int(index)}"], capture_output=True, text=True)
+    return out.stdout.strip()
 
 
 def containers():
@@ -96,9 +124,6 @@ class Handler(BaseHTTPRequestHandler):
     def do_GET(self):
         u = urllib.parse.urlparse(self.path)
         q = urllib.parse.parse_qs(u.query)
-        if u.path == "/":
-            with open(os.path.join(ROOT, "index.html"), "rb") as f:
-                return self.reply(200, f.read(), "text/html; charset=utf-8")
         if u.path == "/api/state":
             state = {"dozzle": DOZZLE, "containers": containers(), "jobs": jobs, "cities": humans(), "settlement": settlement()}
             for k in ("nodes", "map", "assignment", "cells"):
@@ -118,10 +143,44 @@ class Handler(BaseHTTPRequestHandler):
             name = u.path.rsplit("/", 1)[1]
             out = subprocess.run(["docker", "logs", "--tail", q.get("tail", ["200"])[0], name], capture_output=True, text=True)
             return self.reply(200, out.stdout + out.stderr, "text/plain; charset=utf-8")
+        if u.path == "/api/worldid/config":
+            code, body = cp("/v1/world-id/config")
+            return self.reply(code, body)
+        if u.path == "/api/worldid/account":
+            index = int(q.get("index", ["27"])[0])
+            if not 0 <= index < 60:
+                return self.reply(400, {"error": "devnet keys are 0 to 59"})
+            return self.reply(200, {"index": index, "account": address_of(index)})
         if u.path.startswith("/api/jobs/"):
             job = jobs.get(u.path.rsplit("/", 1)[1])
             return self.reply(200 if job else 404, job or {"error": "no such job"})
-        self.reply(404, {"error": "not found"})
+        if u.path.startswith("/api/"):
+            return self.reply(404, {"error": "not found"})
+        self.static(u.path)
+
+    def do_HEAD(self):  # Next.js prefetches routes with HEAD
+        self.static(urllib.parse.urlparse(self.path).path, head=True)
+
+    def static(self, path, head=False):
+        """A file of the export: /nodes/ is nodes/index.html, anything missing is its 404 page."""
+        f = os.path.realpath(os.path.join(WEB, urllib.parse.unquote(path).lstrip("/")))
+        if os.path.isdir(f):
+            f = os.path.join(f, "index.html")
+        code = 200
+        if not f.startswith(WEB + os.sep) or not os.path.isfile(f):
+            code, f = 404, os.path.join(WEB, "404.html")
+        if not os.path.isfile(f):
+            return self.reply(404, "the dashboard page is not built: npm run build in deploy/dashboard/web", "text/plain")
+        with open(f, "rb") as fh:
+            data = fh.read()
+        self.send_response(code)
+        self.send_header("content-type", mimetypes.guess_type(f)[0] or "application/octet-stream")
+        self.send_header("content-length", str(len(data)))
+        if "/_next/static/" in path:
+            self.send_header("cache-control", "public, max-age=31536000, immutable")
+        self.end_headers()
+        if not head:
+            self.wfile.write(data)
 
     def do_POST(self):
         try:
@@ -135,6 +194,20 @@ class Handler(BaseHTTPRequestHandler):
                     return self.reply(409, {"error": f"{label} is already being added"})
                 script = "deploy/scripts/add-client.sh" if kind == "client" else "deploy/scripts/add-node.sh"
                 return self.reply(202, start_job(f"add-{kind}", label, ["sh", script, label, str(lat), str(lon)]))
+            if self.path == "/api/worldid/request":
+                code, out = cp("/v1/world-id/request", {"role": str(body["role"])})
+                return self.reply(code, out)
+            if self.path == "/api/worldid/verify":
+                role, index = str(body["role"]), int(body["index"])
+                account = address_of(index)
+                code, out = cp("/v1/world-id/verify", {"role": role, "account": account, "result": body["result"]})
+                if code != 200:
+                    return self.reply(code, out)
+                p = out["proof"]
+                cmd = ["sh", "deploy/scripts/worldid-register.sh", role, str(index), str(p["nullifier"]), str(p["nonce"]),
+                       str(p["expires_at_min"]), str(p["issuer_schema_id"]), str(p["credential_genesis_issued_at_min"])] \
+                    + [str(x) for x in p["proof"]]
+                return self.reply(200, {**out, "account": account, **start_job("worldid-" + role, account, cmd)})
             city = str(body["city"])
             index = body.get("index")
             index = "-" if index in (None, "") else str(int(index))

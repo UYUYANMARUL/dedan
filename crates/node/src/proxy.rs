@@ -207,6 +207,17 @@ impl ProxyHttp for Proxy {
             self.respond(session, 400).await?;
             return Ok(true);
         };
+        // Pingora 0.9 replays a request as HTTP/1 text for the background refresh of stale-while-revalidate
+        // (`pseudo_raw_h1_request_header`). An HTTP/2 request comes out with `HTTP/2` in the request line, which its
+        // own HTTP/1 parser refuses, and without a Host header (HTTP/2 names the host in `:authority`), so the
+        // refresh never ran and the object stayed stale. Both are informational for an HTTP/2 downstream, and the
+        // upstream request is HTTP/1.1 anyway.
+        if session.req_header().version == http::Version::HTTP_2 {
+            session.req_header_mut().set_version(http::Version::HTTP_11);
+        }
+        if session.req_header().headers.get("host").is_none() {
+            session.req_header_mut().insert_header("host", host.as_str())?;
+        }
         match self.node().route(&host) {
             Some(route) => {
                 ctx.account = Some(route);

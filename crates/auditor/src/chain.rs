@@ -54,7 +54,7 @@ fn proof(me: Address, action: &str) -> IDedanRegistry::WorldIdProof {
         nullifier: U256::from_be_bytes(n.0),
         nonce: U256::ZERO,
         expiresAtMin: 0,
-        issuerSchemaId: 0,
+        issuerSchemaId: 1, // Proof of Human: the only credential the registry takes
         credentialGenesisIssuedAtMin: U256::ZERO,
         proof: [U256::ZERO; 5],
     }

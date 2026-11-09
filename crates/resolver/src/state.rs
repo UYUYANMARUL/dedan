@@ -53,6 +53,8 @@ pub struct Config {
     /// The aggregator's API: the previous period's published sets, quality and bills, so the resolver's slot
     /// sets are the ones the aggregator pays for, and unapplied bills count against balances.
     pub aggregator_url: Option<String>,
+    /// The attestation token window in minutes (the aggregator's; wide on the devnet, whose chain clock jumps).
+    pub attestation_token_max_age_min: u64,
 }
 
 impl Config {
@@ -80,6 +82,7 @@ impl Config {
             balance_periods: get("DEDAN_BALANCE_PERIODS", "4").parse()?,
             price_version: get("DEDAN_PRICE_VERSION", "1").parse()?,
             aggregator_url: std::env::var("DEDAN_AGGREGATOR_URL").ok().filter(|s| !s.is_empty()),
+            attestation_token_max_age_min: get("DEDAN_ATTESTATION_TOKEN_MAX_AGE_MIN", "10").parse()?,
         })
     }
 
@@ -307,6 +310,8 @@ pub struct Snapshot {
     pub map: Map,
     pub map_evidence: Vec<map::Evidence>,
     pub assignment: Assignment,
+    /// Each joined cell's A records from its ENS resolver, lowest median first: what a client in it is answered.
+    pub steer: BTreeMap<Cell, Vec<Ipv4Addr>>,
     pub updated_at: u64,
     pub block: u64,
 }
@@ -469,6 +474,10 @@ impl State {
             .replay(&self.provider, &[chain.registry, chain.cells], head)
             .await?;
         let records = chain.ens.node_records(identity.nodes.keys()).await?;
+        let mut steer = BTreeMap::new();
+        for cell in identity.members.keys() {
+            steer.insert(*cell, chain.ens.cell_ipv4(*cell).await?);
+        }
         let now = unix_now();
         if let Some(cp) = &self.cfg.cp_url {
             if let Err(e) = self.sync_accounts(cp, chain.settlement).await {
@@ -488,6 +497,7 @@ impl State {
         }
         let params = MapParams {
             k_min: self.cfg.map_k,
+            token_max_age_min: self.cfg.attestation_token_max_age_min,
             ..MapParams::v1()
         };
         let labels = identity.labels_by_hash();
@@ -543,6 +553,7 @@ impl State {
             map,
             map_evidence,
             assignment,
+            steer,
             updated_at: now,
             block: head,
         };

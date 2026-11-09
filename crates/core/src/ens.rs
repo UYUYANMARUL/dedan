@@ -3,7 +3,7 @@
 //! records (ENSIP-6). Everything is read through the Universal Resolver per ENSIP-10, so the nameserver
 //! follows the same path as any ENS client; `alloy-ens` supplies the name encoding.
 
-use crate::types::{Class, LatLon, NodeId};
+use crate::types::{Cell, Class, LatLon, NodeId};
 use alloy::primitives::{keccak256, Address, Bytes, B256};
 use alloy::providers::Provider;
 use alloy::sol;
@@ -212,6 +212,20 @@ impl<P: Provider + Clone> EnsClient<P> {
             enc_key: self.text(&name, node, KEY_ENCKEY).await?,
             version: self.text(&name, node, KEY_VERSION).await?,
         })
+    }
+
+    /// The A records of the cell name `<hex>.<parent>`: its members' endpoints, lowest median first, as the cells
+    /// contract ranks them (`DedanCells.dnsRecord`). A cell with no name or no voted member has none.
+    pub async fn cell_ipv4(&self, cell: Cell) -> Result<Vec<Ipv4Addr>, EnsError> {
+        let fq = format!("{:x}.{}", cell.0, self.parent);
+        let rrs = self
+            .dns_record(&alloy_ens::dns_encode(&fq), alloy_ens::namehash(&fq), RR_A)
+            .await?;
+        Ok(parse_rrset(&rrs)
+            .into_iter()
+            .filter(|(t, _)| *t == RR_A)
+            .filter_map(|(_, rd)| <[u8; 4]>::try_from(rd.as_slice()).ok().map(Ipv4Addr::from))
+            .collect())
     }
 
     /// The records of every given name, in one table. ponytail: sequential reads; batch them through

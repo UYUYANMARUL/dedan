@@ -1,0 +1,1 @@
+{ "count": 1, "nodes": [ { "label": "nara", "ip": "10.77.1.30", "location": "34.6851,135.8048", "cell": "586284338941788159", "attester": 45, "user": "user-nara", "kind": "client" } ] }

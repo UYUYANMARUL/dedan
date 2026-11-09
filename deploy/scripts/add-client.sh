@@ -1,10 +1,11 @@
 #!/bin/sh
 # Adds a client, a human's device at a chosen location, to the running devnet (demo only):
 #   sh deploy/scripts/add-client.sh <label> <lat> <lon>        e.g.  berlin 52.52 13.405
-# Starts a user container on the simulated WAN in its own /24 (10.77.<n>.0/24, n = 1..15: the address is what tells
-# the nameserver where the client is), with round trips to every node derived from the great-circle distance,
+# Starts a user container on the simulated WAN in its own /24 (10.77.<n>.0/24 for n = 1..15, then 10.77.<160+n>.0/24
+# past the node cities' /20s, up to 95 clients: the address is what tells the nameserver where the client is), with round trips to every node derived from the great-circle distance,
 # randomised by ±20 % per node plus per-packet jitter. Its DNS is the nameserver, so `dig`/`curl www.images.com`
-# from it are steered like a real user's. The human behind it holds anvil key 45+n and starts unverified: the
+# from it are steered like a real user's. The human behind it holds anvil key 44+n (funded here past anvil's 60
+# accounts) and starts unverified: the
 # dashboard's "verify with World ID (mock)" registers it as an attester, then it can submit node metrics.
 set -eu
 cd "$(dirname "$0")/../.."
@@ -14,11 +15,13 @@ echo "$label" | grep -Eq '^[a-z][a-z0-9-]{1,30}$' || { echo "label: lowercase le
 [ -z "$(host_field "user-$label" 1)" ] && [ -z "$(host_field "$label" 1)" ] || { echo "$label already exists" >&2; exit 1; }
 touch "$DYNAMIC_HOSTS"
 n=$(( 1 + $(ls deploy/devnet/clients 2>/dev/null | wc -l) ))
-[ "$n" -le 15 ] || { echo "at most 15 clients" >&2; exit 1; }
-ip="10.77.$n.30"; attester=$((44 + n))
+[ "$n" -le 95 ] || { echo "at most 95 clients" >&2; exit 1; }
+octet=$n; [ "$n" -le 15 ] || octet=$((160 + n))
+ip="10.77.$octet.30"; attester=$((44 + n))
+[ "$attester" -le 59 ] || cast rpc anvil_setBalance "$(address_of "$attester")" 0x3635c9adc5dea00000 --rpc-url http://anvil:8545 >/dev/null
 dir=deploy/devnet/clients/$label; mkdir -p "$dir"
 cell=$(curl -sf "$NS_API/cell?lat=$lat&lon=$lon" | python3 -c "import json,sys; print(json.load(sys.stdin)['cell'])")
-echo "== client $label at $lat,$lon: address $ip (prefix 10.77.$n.0/24), cell $cell, human key index $attester"
+echo "== client $label at $lat,$lon: address $ip (prefix 10.77.$octet.0/24), cell $cell, human key index $attester"
 
 # WAN tables for the container: existing containers send toward this /24 undelayed, so the client carries the whole
 # round trip on its side (wan.sh applies half of the table entry, hence 2x). Round trip: (5 ms + 20 ms per 1000 km)
